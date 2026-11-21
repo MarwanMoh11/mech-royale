@@ -111,11 +111,34 @@ pub struct Tree {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct RoofEdgePoint {
+    pub pos: [f64; 3],         // Inset ~3.2m from outer rim (safe standing center on roof)
+    pub outward_yaw: f64,      // Outward normal of this roof edge
+    pub launch_xy: [f64; 2],   // Ground/podium launch point ~4.5m outside the wall
+    pub drop_z: f64,           // Highest walkable surface z below roof at launch_xy
+    pub launch_clear: bool,    // True if a mech cylinder fits cleanly at launch_xy/drop_z
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RoofHop {
+    pub to_roof_idx: usize,
+    pub from_pos: [f64; 3],
+    pub to_pos: [f64; 3],
+    pub horiz_dist: f64,
+    pub dz: f64,
+    pub min_energy: f64,
+}
+
+#[derive(Debug, Clone)]
 pub struct Rooftop {
     pub prism_id: usize,
-    pub pos: [f64; 3], // safe interior point on top of roof
-    pub height_above_ground: f64,
+    pub pos: [f64; 3],                // Pole-of-inaccessibility deepest interior point
+    pub height_above_ground: f64,     // 6..=78m
     pub area: f64,
+    pub has_penthouse_cover: bool,
+    pub interior_pts: Vec<[f64; 3]>,  // 3..6 recessed interior & penthouse-shadow cover points
+    pub edge_pts: Vec<RoofEdgePoint>, // 6..12 rim peek & ground-climb entry points
+    pub hops: Vec<RoofHop>,           // Top 6 reachable adjacent roofs
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +163,7 @@ pub struct ArenaMap {
     t_nx: usize,
     t_ny: usize,
     t_scale: f64,
+    max_terrain_z: f64,
     terrain: Vec<i16>,
     // Prisms & spatial grid
     pub prisms: Vec<Prism>,
@@ -153,8 +177,9 @@ pub struct ArenaMap {
     tree_grid: Vec<Vec<u16>>,
     pub canopy_density: f64,
     pub canopy_block_t: f64,
-    // Tactical rooftops
+    // Tactical rooftops + O(1) prism->roof lookup
     pub rooftops: Vec<Rooftop>,
+    pub prism_to_roof: Vec<Option<u16>>,
     // Coarse 2D navigation grid (ground walkability, headroom for cube-growth bridge clearance, elevation, cover)
     pub nav_nx: usize,
     pub nav_ny: usize,
@@ -188,9 +213,14 @@ impl ArenaMap {
             ));
         }
         let mut terrain = Vec::with_capacity(expected_samples);
+        let mut max_terrain_z = f64::NEG_INFINITY;
         for chunk in raw_bytes[..expected_samples * 2].chunks_exact(2) {
-            terrain.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+            let v = i16::from_le_bytes([chunk[0], chunk[1]]);
+            let z = v as f64 * raw.terrain.scale;
+            if z > max_terrain_z { max_terrain_z = z; }
+            terrain.push(v);
         }
+        if !max_terrain_z.is_finite() { max_terrain_z = 0.0; }
 
         // Parse prisms
         let mut prisms = Vec::with_capacity(raw.prisms.len());
@@ -324,6 +354,7 @@ impl ArenaMap {
             t_nx: raw.terrain.nx,
             t_ny: raw.terrain.ny,
             t_scale: raw.terrain.scale,
+            max_terrain_z,
             terrain,
             prisms,
             grid_min_x,
@@ -336,6 +367,7 @@ impl ArenaMap {
             canopy_density: raw.rules.canopy_density,
             canopy_block_t: raw.rules.canopy_block_t,
             rooftops: Vec::new(),
+            prism_to_roof: Vec::new(),
             nav_nx: 0,
             nav_ny: 0,
             nav_min_x: raw.bounds.min_x + 4.0,
@@ -362,6 +394,7 @@ impl ArenaMap {
             t_nx: 2,
             t_ny: 2,
             t_scale: 0.01,
+            max_terrain_z: 0.0,
             terrain: vec![0; 4],
             prisms: Vec::new(),
             grid_min_x: -550.0,
@@ -374,6 +407,7 @@ impl ArenaMap {
             canopy_density: 0.35,
             canopy_block_t: 0.25,
             rooftops: Vec::new(),
+            prism_to_roof: Vec::new(),
             nav_nx: 1,
             nav_ny: 1,
             nav_min_x: 0.0,
@@ -386,42 +420,257 @@ impl ArenaMap {
     }
 
     fn build_rooftops_and_nav(&mut self) {
-        // 1. Identify climbable tactical rooftops with full cylinder clearance check!
-        for (idx, p) in self.prisms.iter().enumerate() {
-            if p.area < 45.0 {
+        self.prism_to_roof = vec![None; self.prisms.len()];
+
+        // 1. Identify climbable tactical rooftops with interior/penthouse cover & perimeter edge-peek points!
+        // Exclude PrismKind::Stadium (jagged multi-tier bowl/bleacher trap!)
+        for idx in 0..self.prisms.len() {
+            let (p_kind, p_area, p_top, p_min_x, p_max_x, p_min_y, p_max_y) = {
+                let p = &self.prisms[idx];
+                (p.kind, p.area, p.top, p.min_x, p.max_x, p.min_y, p.max_y)
+            };
+            if p_area < 45.0 || p_kind == PrismKind::Stadium {
                 continue;
             }
-            let mut pt = None;
-            if self.point_in_prism_2d(idx, p.centroid[0], p.centroid[1])
-                && !self.is_cylinder_blocked(p.centroid[0], p.centroid[1], p.top + 0.05, 2.7, 9.5, 0.5)
-            {
-                pt = Some(p.centroid);
-            } else {
-                'search: for gx in 1..=5 {
-                    for gy in 1..=5 {
-                        let x = p.min_x + (p.max_x - p.min_x) * (gx as f64 / 6.0);
-                        let y = p.min_y + (p.max_y - p.min_y) * (gy as f64 / 6.0);
-                        if self.point_in_prism_2d(idx, x, y)
-                            && !self.is_cylinder_blocked(x, y, p.top + 0.05, 2.7, 9.5, 0.5)
-                        {
-                            pt = Some([x, y]);
-                            break 'search;
-                        }
+
+            // Sample up to 9x9 grid inside AABB to find true pole-of-inaccessibility + recessed interior points
+            let max_dim = (p_max_x - p_min_x).max(p_max_y - p_min_y).max(1.0);
+            let step = (max_dim / 9.0).clamp(3.5, 9.0);
+            let nx = ((p_max_x - p_min_x) / step).ceil().clamp(2.0, 9.0) as usize;
+            let ny = ((p_max_y - p_min_y) / step).ceil().clamp(2.0, 9.0) as usize;
+
+            let mut valid_pts: Vec<(f64, [f64; 3])> = Vec::new();
+            for gy in 1..ny {
+                let y = p_min_y + (p_max_y - p_min_y) * (gy as f64 / ny as f64);
+                for gx in 1..nx {
+                    let x = p_min_x + (p_max_x - p_min_x) * (gx as f64 / nx as f64);
+                    if !self.point_in_prism_2d(idx, x, y) {
+                        continue;
+                    }
+                    if self.is_cylinder_blocked(x, y, p_top + 0.05, 2.7, 9.5, 0.5) {
+                        continue;
+                    }
+                    let d_outer = dist_sq_to_ring(x, y, &self.prisms[idx].outer).sqrt();
+                    if d_outer >= 2.0 {
+                        valid_pts.push((d_outer, [x, y, p_top]));
                     }
                 }
             }
-            if let Some([rx, ry]) = pt {
-                let tz = self.terrain_z(rx, ry);
-                let h_ag = p.top - tz;
-                if (6.0..=52.0).contains(&h_ag) {
-                    self.rooftops.push(Rooftop {
-                        prism_id: idx,
-                        pos: [rx, ry, p.top],
-                        height_above_ground: h_ag,
-                        area: p.area,
+            if valid_pts.is_empty() {
+                let c = self.prisms[idx].centroid;
+                if self.point_in_prism_2d(idx, c[0], c[1])
+                    && !self.is_cylinder_blocked(c[0], c[1], p_top + 0.05, 2.7, 9.5, 0.5)
+                {
+                    let d_outer = dist_sq_to_ring(c[0], c[1], &self.prisms[idx].outer).sqrt();
+                    valid_pts.push((d_outer, [c[0], c[1], p_top]));
+                }
+            }
+            if valid_pts.is_empty() {
+                continue;
+            }
+            valid_pts.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let pole = valid_pts[0].1;
+            let tz = self.terrain_z(pole[0], pole[1]);
+            let h_ag = p_top - tz;
+            if !(6.0..=78.0).contains(&h_ag) {
+                continue;
+            }
+
+            // Detect adjacent/embedded taller penthouse prisms for 360-deg rooftop cover!
+            let mut has_penthouse_cover = false;
+            let mut interior_pts: Vec<[f64; 3]> = Vec::new();
+            for q_idx in 0..self.prisms.len() {
+                if q_idx == idx { continue; }
+                let q = &self.prisms[q_idx];
+                if q.top < p_top + 4.5 || q.base > p_top + 2.0 { continue; }
+                if q.max_x < p_min_x - 8.0 || q.min_x > p_max_x + 8.0 || q.max_y < p_min_y - 8.0 || q.min_y > p_max_y + 8.0 {
+                    continue;
+                }
+                has_penthouse_cover = true;
+                let qx = q.centroid[0];
+                let qy = q.centroid[1];
+                let rx = (q.max_x - q.min_x) * 0.5 + 4.5;
+                let ry = (q.max_y - q.min_y) * 0.5 + 4.5;
+                for &(ox, oy) in &[(rx, 0.0), (-rx, 0.0), (0.0, ry), (0.0, -ry)] {
+                    let sx = qx + ox;
+                    let sy = qy + oy;
+                    if self.point_in_prism_2d(idx, sx, sy)
+                        && !self.is_cylinder_blocked(sx, sy, p_top + 0.05, 2.8, 9.5, 0.5)
+                    {
+                        if interior_pts.iter().all(|a| (a[0] - sx).hypot(a[1] - sy) >= 6.0) {
+                            interior_pts.push([sx, sy, p_top]);
+                        }
+                    }
+                }
+                if interior_pts.len() >= 4 { break; }
+            }
+            // Fill remaining interior points (up to 6) with deepest well-spaced spots
+            for &(_, pt) in &valid_pts {
+                if interior_pts.len() >= 6 { break; }
+                if interior_pts.iter().all(|a| (a[0] - pt[0]).hypot(a[1] - pt[1]) >= 7.0) {
+                    interior_pts.push(pt);
+                }
+            }
+            if interior_pts.is_empty() {
+                interior_pts.push(pole);
+            }
+
+            // Generate 6..12 perimeter edge-peek & ground-climb launch points along outer ring!
+            let mut edge_pts: Vec<RoofEdgePoint> = Vec::new();
+            let ring = self.prisms[idx].outer.clone();
+            let n_ring = ring.len();
+            let mut acc_len = 0.0;
+            let spacing = (max_dim * 0.35).clamp(11.0, 18.0);
+            let mut next_sample = 4.0;
+            for i in 0..n_ring {
+                if edge_pts.len() >= 12 { break; }
+                let a = ring[i];
+                let b = ring[(i + 1) % n_ring];
+                let ex = b[0] - a[0];
+                let ey = b[1] - a[1];
+                let seg_len = ex.hypot(ey);
+                if seg_len < 1.5 { continue; }
+                let ux = ex / seg_len;
+                let uy = ey / seg_len;
+                // Test both perpendicular normals to identify inward vs outward (winding-agnostic!)
+                let n1 = [-uy, ux];
+                let n2 = [uy, -ux];
+
+                let mut pos_on_seg = next_sample - acc_len;
+                while pos_on_seg <= seg_len && edge_pts.len() < 12 {
+                    let bx = a[0] + ux * pos_on_seg;
+                    let by = a[1] + uy * pos_on_seg;
+                    let in_n = if self.point_in_prism_2d(idx, bx + n1[0] * 1.5, by + n1[1] * 1.5) {
+                        n1
+                    } else if self.point_in_prism_2d(idx, bx + n2[0] * 1.5, by + n2[1] * 1.5) {
+                        n2
+                    } else {
+                        pos_on_seg += spacing;
+                        continue;
+                    };
+                    let out_n = [-in_n[0], -in_n[1]];
+                    let ix = bx + in_n[0] * 3.2;
+                    let iy = by + in_n[1] * 3.2;
+                    if self.point_in_prism_2d(idx, ix, iy)
+                        && !self.is_cylinder_blocked(ix, iy, p_top + 0.05, 2.7, 9.5, 0.5)
+                        && edge_pts.iter().all(|ep| (ep.pos[0] - ix).hypot(ep.pos[1] - iy) >= 9.0)
+                    {
+                        let out_yaw = out_n[1].atan2(out_n[0]);
+                        let lx = (bx + out_n[0] * 4.8).clamp(self.min_x + 6.0, self.max_x - 6.0);
+                        let ly = (by + out_n[1] * 4.8).clamp(self.min_y + 6.0, self.max_y - 6.0);
+                        // Compute highest lower surface (supports Morrill/Lincoln Tower 9.4m podiums!)
+                        let mut drop_z = self.terrain_z(lx, ly);
+                        if let Some((gx, gy)) = self.grid_coords(lx, ly) {
+                            for &qid in &self.prism_grid[gy * self.grid_nx + gx] {
+                                let q_idx = qid as usize;
+                                if q_idx == idx { continue; }
+                                let q = &self.prisms[q_idx];
+                                if q.top < p_top - 1.5 && q.top > drop_z && self.point_in_prism_2d(q_idx, lx, ly) {
+                                    drop_z = q.top;
+                                }
+                            }
+                        }
+                        let launch_clear = !self.is_cylinder_blocked(lx, ly, drop_z + 0.05, 2.7, 9.5, 1.2)
+                            && !self.is_covered_above(lx, ly, drop_z + 1.0, (p_top - drop_z).max(4.0) + 6.0);
+                        // Ensure outward sightline isn't immediately buried inside an adjacent taller wall
+                        let out_eye = [ix, iy, p_top + 6.0];
+                        let out_chk = [ix + out_n[0] * 8.0, iy + out_n[1] * 8.0, p_top + 6.0];
+                        if self.has_shot_los(out_eye, out_chk) {
+                            edge_pts.push(RoofEdgePoint {
+                                pos: [ix, iy, p_top],
+                                outward_yaw: out_yaw,
+                                launch_xy: [lx, ly],
+                                drop_z,
+                                launch_clear,
+                            });
+                        }
+                    }
+                    pos_on_seg += spacing;
+                }
+                acc_len += seg_len;
+                while next_sample <= acc_len {
+                    next_sample += spacing;
+                }
+            }
+            // Ensure at least 1 edge point exists
+            if edge_pts.is_empty() {
+                let lx = (pole[0] + 5.0).clamp(self.min_x + 6.0, self.max_x - 6.0);
+                let ly = pole[1].clamp(self.min_y + 6.0, self.max_y - 6.0);
+                let dz = self.terrain_z(lx, ly);
+                edge_pts.push(RoofEdgePoint {
+                    pos: pole,
+                    outward_yaw: 0.0,
+                    launch_xy: [lx, ly],
+                    drop_z: dz,
+                    launch_clear: !self.is_cylinder_blocked(lx, ly, dz + 0.05, 2.7, 9.5, 1.2),
+                });
+            }
+
+            let roof_idx = self.rooftops.len();
+            self.prism_to_roof[idx] = Some(roof_idx as u16);
+            self.rooftops.push(Rooftop {
+                prism_id: idx,
+                pos: pole,
+                height_above_ground: h_ag,
+                area: p_area,
+                has_penthouse_cover,
+                interior_pts,
+                edge_pts,
+                hops: Vec::new(),
+            });
+        }
+
+        // 1b. Precompute Roof-to-Roof Hop Graph (adjacent roofs within 22m air gap!)
+        let nr = self.rooftops.len();
+        for a in 0..nr {
+            let pa = &self.prisms[self.rooftops[a].prism_id];
+            let mut hops: Vec<RoofHop> = Vec::new();
+            for b in 0..nr {
+                if a == b { continue; }
+                let pb = &self.prisms[self.rooftops[b].prism_id];
+                // Quick AABB distance reject (> 26m)
+                let dx_bb = (pa.min_x - pb.max_x).max(pb.min_x - pa.max_x).max(0.0);
+                let dy_bb = (pa.min_y - pb.max_y).max(pb.min_y - pa.max_y).max(0.0);
+                if dx_bb.hypot(dy_bb) > 26.0 { continue; }
+                let dz = pb.top - pa.top;
+                if dz < -32.0 || dz > 26.0 { continue; }
+
+                // Closest (edge_a, edge_b) pair
+                let mut best_pair: Option<(f64, [f64; 3], [f64; 3])> = None;
+                for ea in &self.rooftops[a].edge_pts {
+                    for eb in &self.rooftops[b].edge_pts {
+                        let d = (ea.pos[0] - eb.pos[0]).hypot(ea.pos[1] - eb.pos[1]);
+                        if best_pair.map(|(bd, _, _)| d < bd).unwrap_or(true) {
+                            best_pair = Some((d, ea.pos, eb.pos));
+                        }
+                    }
+                }
+                if let Some((hd, from_p, to_p)) = best_pair {
+                    let air_gap = (hd - 6.4).max(0.0);
+                    if air_gap > 22.0 { continue; }
+                    let min_energy = if dz <= 0.5 {
+                        if air_gap <= 9.5 { 10.0 } else { 10.0 + (air_gap - 9.5) * 1.7 }
+                    } else {
+                        ((dz / 8.8).max(air_gap / 13.0)) * 16.5 + 10.0
+                    };
+                    if min_energy > 75.0 { continue; }
+                    let mid_z = from_p[2].max(to_p[2]) + 4.0;
+                    if !self.has_shot_los([from_p[0], from_p[1], mid_z], [to_p[0], to_p[1], mid_z]) {
+                        continue;
+                    }
+                    hops.push(RoofHop {
+                        to_roof_idx: b,
+                        from_pos: from_p,
+                        to_pos: to_p,
+                        horiz_dist: hd,
+                        dz,
+                        min_energy,
                     });
                 }
             }
+            hops.sort_by(|x, y| x.min_energy.partial_cmp(&y.min_energy).unwrap_or(std::cmp::Ordering::Equal));
+            hops.truncate(6);
+            self.rooftops[a].hops = hops;
         }
 
         // 2. Build 8m ground navigation grid with dynamic headroom (for cube-grown bridge clearance!)
@@ -553,6 +802,40 @@ impl ArenaMap {
             }
         }
         false
+    }
+
+    /// O(1) lookup: returns index into `self.rooftops` if `(x, y, feet_z)` is standing on a tracked rooftop!
+    #[inline]
+    pub fn rooftop_at(&self, x: f64, y: f64, feet_z: f64) -> Option<usize> {
+        let (gx, gy) = self.grid_coords(x, y)?;
+        for &pid in &self.prism_grid[gy * self.grid_nx + gx] {
+            let p_idx = pid as usize;
+            if let Some(r_idx) = self.prism_to_roof[p_idx] {
+                let p = &self.prisms[p_idx];
+                if (p.top - feet_z).abs() < 1.3 && self.point_in_prism_2d(p_idx, x, y) {
+                    return Some(r_idx as usize);
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns the highest tracked rooftop covering `(x, y)` (for Phase 5-6 pin fortress check!).
+    pub fn rooftop_covering(&self, x: f64, y: f64) -> Option<usize> {
+        let (gx, gy) = self.grid_coords(x, y)?;
+        let mut best: Option<(f64, usize)> = None;
+        for &pid in &self.prism_grid[gy * self.grid_nx + gx] {
+            let p_idx = pid as usize;
+            if let Some(r_idx) = self.prism_to_roof[p_idx] {
+                let p = &self.prisms[p_idx];
+                if self.point_in_prism_2d(p_idx, x, y) {
+                    if best.map(|(bt, _)| p.top > bt).unwrap_or(true) {
+                        best = Some((p.top, r_idx as usize));
+                    }
+                }
+            }
+        }
+        best.map(|(_, idx)| idx)
     }
 
     /// Support floor height under (x, y) reachable from feet_z (stepping up by step_up).
@@ -714,7 +997,7 @@ impl ArenaMap {
             f64::INFINITY
         };
 
-        let mut tested = [0u64; 5]; // bitset for up to 320 prisms! Zero heap allocs!
+        let mut tested = [0u64; 16]; // bitset for up to 1024 prisms! Zero heap allocs!
         let max_steps = ((end_ix - ix).abs() + (end_iy - iy).abs() + 2).min(200);
 
         for _ in 0..max_steps {
@@ -755,42 +1038,44 @@ impl ArenaMap {
             }
         }
 
-        // 2. Check terrain intersection up to best_t (1.8m steps for berm precision)
-        let step: f64 = 1.8;
-        let mut prev_t: f64 = 0.0;
-        let mut t = step.min(best_t);
-        while prev_t < best_t {
-            let x = origin[0] + dir[0] * t;
-            let y = origin[1] + dir[1] * t;
-            let z = origin[2] + dir[2] * t;
-            let tz = self.terrain_z(x, y);
-            if z <= tz {
-                // Binary search refine between prev_t and t
-                let mut lo = prev_t;
-                let mut hi = t;
-                for _ in 0..6 {
-                    let mid = 0.5 * (lo + hi);
-                    let mx = origin[0] + dir[0] * mid;
-                    let my = origin[1] + dir[1] * mid;
-                    let mz = origin[2] + dir[2] * mid;
-                    if mz <= self.terrain_z(mx, my) {
-                        hi = mid;
-                    } else {
-                        lo = mid;
+        // 2. Check terrain intersection up to best_t (skip when ray stays strictly above max_terrain_z; adaptive step!)
+        let end_z = origin[2] + dir[2] * best_t;
+        if !(origin[2] > self.max_terrain_z + 0.5 && end_z > self.max_terrain_z + 0.5) {
+            let mut prev_t: f64 = 0.0;
+            let mut t = (2.0f64).min(best_t);
+            while prev_t < best_t {
+                let x = origin[0] + dir[0] * t;
+                let y = origin[1] + dir[1] * t;
+                let z = origin[2] + dir[2] * t;
+                let tz = self.terrain_z(x, y);
+                if z <= tz {
+                    let mut lo = prev_t;
+                    let mut hi = t;
+                    for _ in 0..6 {
+                        let mid = 0.5 * (lo + hi);
+                        let mx = origin[0] + dir[0] * mid;
+                        let my = origin[1] + dir[1] * mid;
+                        let mz = origin[2] + dir[2] * mid;
+                        if mz <= self.terrain_z(mx, my) {
+                            hi = mid;
+                        } else {
+                            lo = mid;
+                        }
                     }
+                    if hi < best_t {
+                        best_t = hi;
+                        best_prism = None;
+                        hit_any = true;
+                    }
+                    break;
                 }
-                if hi < best_t {
-                    best_t = hi;
-                    best_prism = None;
-                    hit_any = true;
+                if t >= best_t {
+                    break;
                 }
-                break;
+                let step = if z - tz > 4.5 { 3.8 } else { 1.8 };
+                prev_t = t;
+                t = (t + step).min(best_t);
             }
-            if t >= best_t {
-                break;
-            }
-            prev_t = t;
-            t = (t + step).min(best_t);
         }
 
         if hit_any {
@@ -909,6 +1194,7 @@ impl ArenaMap {
         let gy1 = (((max_y - self.grid_min_y) / GRID_CELL).floor().max(0.0) as usize).min(self.grid_ny - 1);
 
         let mut canopy_len = 0.0;
+        let mut seen_trees = [0u64; 64]; // bitset for up to 4096 trees (zero double-counting!)
         // Traverse only cells near line (skip far cells in AABB)
         let nx_perp = -dir[1];
         let ny_perp = dir[0];
@@ -925,7 +1211,14 @@ impl ArenaMap {
                     }
                 }
                 for &tid in &self.tree_grid[gy * self.grid_nx + gx] {
-                    let tr = &self.trees[tid as usize];
+                    let tu = tid as usize;
+                    let word = tu >> 6;
+                    let bit = 1u64 << (tu & 63);
+                    if word < seen_trees.len() {
+                        if (seen_trees[word] & bit) != 0 { continue; }
+                        seen_trees[word] |= bit;
+                    }
+                    let tr = &self.trees[tu];
                     // Trunk cylinder check
                     if let Some((t0, t1)) = ray_cylinder_z(a, dir, dist, tr.x, tr.y, tr.trunk_r, tr.z, tr.crown_base) {
                         if t1 > t0 {
@@ -945,6 +1238,17 @@ impl ArenaMap {
             }
         }
         false
+    }
+
+    /// True if an observer at `eye` cannot see a target mech at `target_pos` (height `target_h`)
+    /// because solids or tree trunks/canopy block BOTH center (0.5*h) and top (1.0*h) per protocol.md §8.
+    pub fn mech_vision_blocked(&self, eye: [f64; 3], target_pos: [f64; 3], target_h: f64) -> bool {
+        let mid = [target_pos[0], target_pos[1], target_pos[2] + 0.5 * target_h];
+        if self.has_shot_los(eye, mid) && !self.trees_block_vision(eye, mid) {
+            return false;
+        }
+        let top = [target_pos[0], target_pos[1], target_pos[2] + target_h];
+        !(self.has_shot_los(eye, top) && !self.trees_block_vision(eye, top))
     }
 
     /// Check if a parabolic mortar trajectory clears solid obstacles up to 95% of flight time.
@@ -996,7 +1300,7 @@ impl ArenaMap {
             let sy = from[1] + (to[1] - from[1]) * frac;
             let tz = self.terrain_z(sx, sy);
             let chk_z = if on_roof { self.support_z(sx, sy, feet_z, step_up, mech_h) } else { tz };
-            if self.terrain_slope_deg(sx, sy) > 48.0
+            if (!on_roof && self.terrain_slope_deg(sx, sy) > 48.0)
                 || self.is_cylinder_blocked(sx, sy, chk_z, mech_r + 0.2, mech_h, step_up)
             {
                 clear = false;
@@ -1011,7 +1315,7 @@ impl ArenaMap {
             return to;
         }
 
-        let start = self.nearest_walkable_cell(from, mech_h as f32);
+        let start = self.nearest_walkable_cell_visible(from, feet_z, mech_r, mech_h, step_up);
         let goal = self.nearest_walkable_cell(to, mech_h as f32);
         if start == goal {
             return to;
@@ -1055,7 +1359,7 @@ impl ArenaMap {
                 break;
             }
             expanded += 1;
-            if expanded > 3200 {
+            if expanded > 1400 {
                 break;
             }
             if ch < best_h {
@@ -1110,9 +1414,17 @@ impl ArenaMap {
         let mut chosen = path[0];
         for &cell_idx in path.iter().take(6) {
             let wp = self.cell_to_world(cell_idx);
-            let mid = [0.5 * (from[0] + wp[0]), 0.5 * (from[1] + wp[1])];
-            let tz = self.terrain_z(mid[0], mid[1]);
-            if !self.is_cylinder_blocked(mid[0], mid[1], tz, mech_r + 0.2, mech_h, step_up) {
+            let mut seg_ok = true;
+            for &frac in &[0.33, 0.67] {
+                let sx = from[0] + (wp[0] - from[0]) * frac;
+                let sy = from[1] + (wp[1] - from[1]) * frac;
+                let tz = self.terrain_z(sx, sy);
+                if self.is_cylinder_blocked(sx, sy, tz, mech_r + 0.2, mech_h, step_up) {
+                    seg_ok = false;
+                    break;
+                }
+            }
+            if seg_ok {
                 chosen = cell_idx;
             } else {
                 break;
@@ -1128,6 +1440,67 @@ impl ArenaMap {
             self.nav_min_x + ix as f64 * NAV_STEP,
             self.nav_min_y + iy as f64 * NAV_STEP,
         ]
+    }
+
+    /// Snaps `from` to the nearest walkable cell without snapping through a solid wall when on the ground.
+    fn nearest_walkable_cell_visible(
+        &self,
+        p: [f64; 2],
+        feet_z: f64,
+        _mech_r: f64,
+        mech_h: f64,
+        _step_up: f64,
+    ) -> (usize, usize) {
+        let need_hr = mech_h as f32;
+        let ix = (((p[0] - self.nav_min_x) / NAV_STEP).round() as isize)
+            .clamp(0, (self.nav_nx - 1) as isize) as usize;
+        let iy = (((p[1] - self.nav_min_y) / NAV_STEP).round() as isize)
+            .clamp(0, (self.nav_ny - 1) as isize) as usize;
+        let ok = |ux: usize, uy: usize| {
+            let idx = uy * self.nav_nx + ux;
+            self.nav_walkable[idx] && self.nav_headroom[idx] >= need_hr
+        };
+        if ok(ix, iy) {
+            return (ix, iy);
+        }
+        let on_ground = feet_z <= self.terrain_z(p[0], p[1]) + 2.5;
+        let p_eye = [p[0], p[1], feet_z + 3.0];
+        let mut fallback: Option<(usize, usize)> = None;
+        let mut los_checks = 0usize;
+        for rad in 1..=8isize {
+            for dy in -rad..=rad {
+                for dx in -rad..=rad {
+                    if dx.abs() != rad && dy.abs() != rad { continue; }
+                    let nx = ix as isize + dx;
+                    let ny = iy as isize + dy;
+                    if nx >= 0 && nx < self.nav_nx as isize && ny >= 0 && ny < self.nav_ny as isize {
+                        let ux = nx as usize;
+                        let uy = ny as usize;
+                        if ok(ux, uy) {
+                            if !on_ground {
+                                return (ux, uy);
+                            }
+                            if fallback.is_none() {
+                                fallback = Some((ux, uy));
+                            }
+                            if rad <= 2 && los_checks < 12 {
+                                los_checks += 1;
+                                let w = self.cell_to_world(uy * self.nav_nx + ux);
+                                let wz = self.nav_z[uy * self.nav_nx + ux];
+                                if self.has_shot_los(p_eye, [w[0], w[1], wz + 3.0]) {
+                                    return (ux, uy);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Only fall back to non-LOS cell once rad >= 2 has been searched (never return a behind-wall rad=1 cell early!)
+            if rad >= 2 && fallback.is_some() {
+                return fallback.unwrap();
+            }
+        }
+        fallback.unwrap_or((ix, iy))
     }
 
     fn nearest_walkable_cell(&self, p: [f64; 2], need_hr: f32) -> (usize, usize) {
@@ -1181,7 +1554,9 @@ struct AStarNode {
 
 impl Eq for AStarNode {}
 impl PartialEq for AStarNode {
-    fn eq(&self, other: &Self) -> bool { self.idx == other.idx }
+    fn eq(&self, other: &Self) -> bool {
+        self.idx == other.idx && self.f.to_bits() == other.f.to_bits()
+    }
 }
 impl Ord for AStarNode {
     fn cmp(&self, other: &Self) -> Ordering {

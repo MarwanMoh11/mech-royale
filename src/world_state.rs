@@ -10,6 +10,48 @@ pub enum MatchMode {
     Ffa,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum LaserPeekState {
+    Idle,
+    ChargeInCover {
+        target_id: i64,
+        cover_pos: [f64; 3],
+        peek_pos: [f64; 3],
+        d_edge: f64,
+        started_t: f64,
+    },
+    PeekOut {
+        target_id: i64,
+        cover_pos: [f64; 3],
+        peek_pos: [f64; 3],
+        started_t: f64,
+    },
+    SnapBack {
+        cover_pos: [f64; 3],
+        until_t: f64,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RoofHopState {
+    pub from_pos: [f64; 3],
+    pub to_pos: [f64; 3],
+    pub to_roof_idx: usize,
+    pub min_energy: f64,
+    pub phase: u8, // 0 = sprint to edge, 1 = jump+jet leap, 2 = settle
+    pub started_t: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ClimbState {
+    pub roof_idx: usize,
+    pub launch_xy: [f64; 2],
+    pub edge_pos: [f64; 3],
+    pub goal_pos: [f64; 3],
+    pub ascending: bool,
+    pub started_t: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct EnemyTrack {
     pub id: i64,
@@ -28,7 +70,17 @@ pub struct EnemyTrack {
     pub damaged_by_us: f64,
     pub dmg_dealt_to_us: f64,
     pub last_hit_us_t: f64,
+    pub last_damaged_by_us_t: f64,
     pub prev_hp: f64,
+    // v3.0 ballistics & awareness tracking
+    pub vel_hist: [[f64; 2]; 6],
+    pub vel_hist_len: usize,
+    pub vel_hist_idx: usize,
+    pub strafe_erratic: f64,
+    pub last_direct_vision_t: f64,
+    pub last_saw_us_t: f64,
+    pub source_is_beam: bool,
+    pub source_is_guess: bool,
 }
 
 impl EnemyTrack {
@@ -50,12 +102,51 @@ impl EnemyTrack {
     pub fn muzzle(&self, base_muzzle: f64, size_per_cube: f64) -> [f64; 3] {
         [self.pos[0], self.pos[1], self.pos[2] + base_muzzle * self.scale(size_per_cube)]
     }
+    pub fn eye(&self, base_eye: f64, size_per_cube: f64) -> [f64; 3] {
+        [self.pos[0], self.pos[1], self.pos[2] + base_eye * self.scale(size_per_cube)]
+    }
     pub fn charge_elapsed(&self, now: f64) -> f64 {
         if self.charging {
             self.charge_start_t.map(|s| (now - s).max(0.0)).unwrap_or(0.0)
         } else {
             0.0
         }
+    }
+    pub fn push_vel_sample(&mut self, vxy: [f64; 2], my_pos: [f64; 3]) {
+        self.vel_hist[self.vel_hist_idx] = vxy;
+        self.vel_hist_idx = (self.vel_hist_idx + 1) % self.vel_hist.len();
+        if self.vel_hist_len < self.vel_hist.len() {
+            self.vel_hist_len += 1;
+        }
+        if self.vel_hist_len < 3 {
+            self.strafe_erratic = 0.25;
+            return;
+        }
+        let dx = self.pos[0] - my_pos[0];
+        let dy = self.pos[1] - my_pos[1];
+        let d = dx.hypot(dy).max(1e-6);
+        let lat_x = -dy / d;
+        let lat_y = dx / d;
+
+        let n = self.vel_hist_len;
+        let start = if n < self.vel_hist.len() { 0 } else { self.vel_hist_idx };
+        let mut prev_lat: f64 = 0.0;
+        let mut flips = 0.0;
+        let mut jitter = 0.0;
+        for k in 0..n {
+            let v = self.vel_hist[(start + k) % self.vel_hist.len()];
+            let lat = v[0] * lat_x + v[1] * lat_y;
+            if k > 0 {
+                if prev_lat.abs() > 2.0 && lat.abs() > 2.0 && (prev_lat * lat < 0.0) {
+                    flips += 1.0;
+                }
+                jitter += (lat - prev_lat).abs();
+            }
+            prev_lat = lat;
+        }
+        let avg_jitter = jitter / ((n - 1) as f64);
+        let raw = (flips * 0.45 + (avg_jitter / 14.0)).clamp(0.0, 1.0);
+        self.strafe_erratic = 0.65 * self.strafe_erratic + 0.35 * raw;
     }
 }
 
@@ -96,6 +187,7 @@ pub struct WorldState {
     pub my_slot: i64,
     pub our_kills: i64,
     pub initial_alive: i64,
+    pub prev_non_self_deaths: i64,
     pub enemies: HashMap<i64, EnemyTrack>,
     pub npcs: HashMap<i64, ActorObs>,
     pub sounds: Vec<SoundContact>,
@@ -111,6 +203,11 @@ pub struct WorldState {
     pub laser_shorted_until: f64,
     pub last_enemy_los_t: f64,
     pub my_laser_charge_start_t: Option<f64>,
+    pub squad_last_saw_us_t: f64,
+    pub healing_mode: bool,
+    // v3.0 Laser Peek & Blind Probe state
+    pub laser_peek: LaserPeekState,
+    pub last_probe_t: f64,
     // Mode detection (Practice 1v15 vs Final FFA)
     pub ffa_evidence: f64,
     pub practice_evidence: f64,
@@ -118,15 +215,22 @@ pub struct WorldState {
     // Movement / stuck tracking
     pub prev_pos: [f64; 3],
     pub prev_t: f64,
+    pub prev_tick: i64,
     pub last_cmd_move: [f64; 2],
     pub stuck_time: f64,
     pub stuck_escape_until: f64,
     pub stuck_escape_dir: [f64; 2],
     pub zone_boost_active: bool,
-    // Rooftop climb commitment & tactical goal hysteresis
-    pub climb_goal: Option<([f64; 3], f64)>,
+    // Rooftop climb, roof-hop & tactical goal hysteresis
+    pub climb_state: Option<ClimbState>,
+    pub roof_hop: Option<RoofHopState>,
     pub climb_cooldown_until: f64,
     pub last_tactical_goal: Option<[f64; 3]>,
+    // Cached A* waypoint (eliminates per-tick heap churn & keeps native max_ms < 1.5ms!)
+    pub astar_cache_from: [f64; 2],
+    pub astar_cache_to: [f64; 2],
+    pub astar_cache_wp: [f64; 2],
+    pub astar_cache_t: f64,
     // Strafe & awareness scan
     pub strafe_sign: f64,
     pub next_strafe_flip_t: f64,
@@ -144,6 +248,7 @@ impl WorldState {
             my_slot: hello.slot,
             our_kills: 0,
             initial_alive: 16,
+            prev_non_self_deaths: 0,
             enemies: HashMap::new(),
             npcs: HashMap::new(),
             sounds: Vec::new(),
@@ -158,19 +263,29 @@ impl WorldState {
             laser_shorted_until: -10.0,
             last_enemy_los_t: -100.0,
             my_laser_charge_start_t: None,
+            squad_last_saw_us_t: -100.0,
+            healing_mode: false,
+            laser_peek: LaserPeekState::Idle,
+            last_probe_t: -100.0,
             ffa_evidence: 0.0,
             practice_evidence: 0.0,
             mode: MatchMode::Unknown,
             prev_pos: [0.0; 3],
             prev_t: -1.0,
+            prev_tick: -10,
             last_cmd_move: [0.0, 0.0],
             stuck_time: 0.0,
             stuck_escape_until: -10.0,
             stuck_escape_dir: [1.0, 0.0],
             zone_boost_active: false,
-            climb_goal: None,
+            climb_state: None,
+            roof_hop: None,
             climb_cooldown_until: -10.0,
             last_tactical_goal: None,
+            astar_cache_from: [0.0, 0.0],
+            astar_cache_to: [0.0, 0.0],
+            astar_cache_wp: [0.0, 0.0],
+            astar_cache_t: -10.0,
             strafe_sign: 1.0,
             next_strafe_flip_t: 1.5,
             scan_yaw: 0.0,
@@ -196,7 +311,7 @@ impl WorldState {
             self.scan_yaw = obs.me.aim[0];
         }
 
-        // Track our own laser charging start time (robust even if server caps reported charge at full!)
+        // Track our own laser charging start time
         let cur_laser_chg = obs
             .me
             .weapons
@@ -215,20 +330,24 @@ impl WorldState {
 
         // 1. Process events
         let mut hit_by_us_ids: Vec<(i64, f64)> = Vec::new();
+        let mut unseen_dmg_mech: Option<(i64, f64)> = None;
         for ev in &obs.events {
             match ev.kind.as_str() {
                 "damaged" => {
                     self.last_combat_t = t;
-                    // Only update directional attacker state for non-zone hits!
                     if let Some(b) = ev.bearing {
                         self.last_damaged_t = t;
                         self.last_damaged_bearing = Some(b);
                         self.last_damaged_rear = ev.rear.unwrap_or(false);
                         if let Some(by) = ev.by {
                             self.last_damaged_by = Some(by);
-                            if let Some(tr) = self.enemies.get_mut(&by) {
-                                tr.dmg_dealt_to_us += ev.amount.unwrap_or(0.0);
-                                tr.last_hit_us_t = t;
+                            if (0..100).contains(&by) {
+                                if let Some(tr) = self.enemies.get_mut(&by) {
+                                    tr.dmg_dealt_to_us += ev.amount.unwrap_or(0.0);
+                                    tr.last_hit_us_t = t;
+                                } else {
+                                    unseen_dmg_mech = Some((by, b));
+                                }
                             }
                         }
                     }
@@ -236,7 +355,14 @@ impl WorldState {
                 "hit" => {
                     self.last_combat_t = t;
                     if let Some(tid) = ev.target {
-                        hit_by_us_ids.push((tid, ev.amount.unwrap_or(0.0)));
+                        let amt = ev.amount.unwrap_or(0.0);
+                        hit_by_us_ids.push((tid, amt));
+                        if (0..100).contains(&tid) {
+                            if let Some(tr) = self.enemies.get_mut(&tid) {
+                                tr.last_damaged_by_us_t = t;
+                                tr.damaged_by_us += amt;
+                            }
+                        }
                     }
                 }
                 "effect" => {
@@ -246,9 +372,16 @@ impl WorldState {
                     }
                 }
                 "kill" => {
-                    self.our_kills += 1;
+                    if ev.target.map(|tid| (0..100).contains(&tid)).unwrap_or(true) {
+                        self.our_kills += 1;
+                    }
                     if let Some(tid) = ev.target {
                         self.enemies.remove(&tid);
+                        if self.last_damaged_by == Some(tid) {
+                            self.last_damaged_by = None;
+                            self.last_damaged_bearing = None;
+                            self.last_damaged_t = -100.0;
+                        }
                     }
                 }
                 _ => {}
@@ -258,7 +391,7 @@ impl WorldState {
             self.last_combat_t = t;
         }
 
-        // 2. Refresh NPCs first (needed to avoid NPC-damage false positives in mode detection!)
+        // 2. Refresh NPCs first
         self.npcs.clear();
         for a in &obs.mechs {
             if a.id != obs.me.id && a.is_npc() {
@@ -266,13 +399,16 @@ impl WorldState {
             }
         }
 
-        // Update tracked enemy mechs
         for tr in self.enemies.values_mut() {
             tr.visible_now = false;
         }
 
         let base_h = self.config.mech_f("height", 9.0);
+        let base_eye = self.config.mech_f("eye_height", 8.0);
+        let base_muz = self.config.mech_f("muzzle_height", 7.0);
+        let base_r = self.config.mech_f("radius", 2.5);
         let spc = self.config.cubes.size_per_cube;
+        let my_eye = obs.me.eye_pos();
 
         for a in &obs.mechs {
             if a.id == obs.me.id || !a.is_mech() {
@@ -286,9 +422,29 @@ impl WorldState {
                 .values()
                 .any(|n| dist2d([a.pos[0], a.pos[1]], [n.pos[0], n.pos[1]]) < 95.0);
 
+            let sc = 1.0 + spc * (cubes.max(0) as f64);
+            let eh = base_h * sc;
+            let e_eye = [a.pos[0], a.pos[1], a.pos[2] + base_eye * sc];
+            let d_to_us = dist3d(e_eye, obs.me.center_pos());
+            let yaw_e_to_us = (obs.me.pos[1] - a.pos[1]).atan2(obs.me.pos[0] - a.pos[0]);
+            // Lightweight enemy-sees-us check (solid LOS only; skip double tree raycast every tick for <2ms budget!)
+            let enemy_sees_us = d_to_us < 142.0
+                && (d_to_us < 38.0 || angle_diff(a.aim[0], yaw_e_to_us).abs() < 1.08)
+                && map.has_shot_los(e_eye, obs.me.center_pos());
+            if enemy_sees_us {
+                self.squad_last_saw_us_t = t;
+            }
+            let direct_vis = map.has_shot_los(my_eye, [a.pos[0], a.pos[1], a.pos[2] + 0.5 * eh]);
+
+            let us_dmg: f64 = hit_by_us_ids
+                .iter()
+                .filter(|(id, _)| *id == a.id)
+                .map(|(_, amt)| *amt)
+                .sum();
+
             if let Some(tr) = self.enemies.get_mut(&a.id) {
                 let gap = (t - tr.last_seen_t).max(0.05);
-                if gap <= 0.35 {
+                if gap <= 0.35 && !tr.source_is_beam && !tr.source_is_guess {
                     let dv = [
                         (a.vel[0] - tr.vel[0]) / gap,
                         (a.vel[1] - tr.vel[1]) / gap,
@@ -303,15 +459,18 @@ impl WorldState {
                     tr.accel = [0.0; 3];
                 }
                 let hp_drop = tr.hp - hp;
-                let us_dmg: f64 = hit_by_us_ids
-                    .iter()
-                    .filter(|(id, _)| *id == a.id)
-                    .map(|(_, amt)| *amt)
-                    .sum();
-                let in_z = dist2d([a.pos[0], a.pos[1]], obs.zone.center) < obs.zone.radius - 5.0;
-                // Only count as FFA damage if >= 40 dmg (above single 25-dmg NPC bullet) and no NPC nearby!
-                if hp_drop > us_dmg + 40.0 && in_z && !near_any_npc {
-                    self.ffa_evidence += 2.2;
+                let in_z = dist2d([a.pos[0], a.pos[1]], obs.zone.center) < obs.zone.radius - 8.0;
+                // Require consecutive obs tick (no skipped hit events!) + tight gap <= 0.25s + hp_drop > us_dmg + 95.0!
+                let no_skipped_obs = self.prev_tick >= 0 && (obs.tick - self.prev_tick) <= 2;
+                if no_skipped_obs
+                    && gap <= 0.25
+                    && hp_drop > us_dmg + 95.0
+                    && in_z
+                    && !near_any_npc
+                    && !tr.source_is_beam
+                    && !tr.source_is_guess
+                {
+                    self.ffa_evidence += 2.6;
                 }
                 tr.prev_hp = tr.hp;
                 tr.pos = a.pos;
@@ -331,37 +490,177 @@ impl WorldState {
                 tr.charging = a.charging;
                 tr.last_seen_t = t;
                 tr.visible_now = true;
-                tr.damaged_by_us += us_dmg;
-            } else {
-                let us_dmg: f64 = hit_by_us_ids
-                    .iter()
-                    .filter(|(id, _)| *id == a.id)
-                    .map(|(_, amt)| *amt)
-                    .sum();
-                let in_z = dist2d([a.pos[0], a.pos[1]], obs.zone.center) < obs.zone.radius - 8.0;
-                if hp < max_hp - 180.0 && us_dmg == 0.0 && in_z && !near_any_npc && t > 5.0 {
-                    self.ffa_evidence += 1.5;
+                tr.source_is_beam = false;
+                tr.source_is_guess = false;
+                if direct_vis {
+                    tr.last_direct_vision_t = t;
                 }
+                if enemy_sees_us {
+                    tr.last_saw_us_t = t;
+                }
+                if us_dmg > 0.0 {
+                    tr.last_damaged_by_us_t = t;
+                }
+                tr.push_vel_sample([a.vel[0], a.vel[1]], obs.me.pos);
+            } else {
+                let mut tr = EnemyTrack {
+                    id: a.id,
+                    pos: a.pos,
+                    vel: a.vel,
+                    accel: [0.0; 3],
+                    aim: a.aim,
+                    hp,
+                    max_hp,
+                    cubes,
+                    weapons: a.weapons.clone(),
+                    charging: a.charging,
+                    charge_start_t: if a.charging { Some(t) } else { None },
+                    last_seen_t: t,
+                    visible_now: true,
+                    damaged_by_us: us_dmg,
+                    dmg_dealt_to_us: 0.0,
+                    last_hit_us_t: -100.0,
+                    last_damaged_by_us_t: if us_dmg > 0.0 { t } else { -100.0 },
+                    prev_hp: hp,
+                    vel_hist: [[0.0; 2]; 6],
+                    vel_hist_len: 0,
+                    vel_hist_idx: 0,
+                    strafe_erratic: 0.25,
+                    last_direct_vision_t: if direct_vis { t } else { -100.0 },
+                    last_saw_us_t: if enemy_sees_us { t } else { -100.0 },
+                    source_is_beam: false,
+                    source_is_guess: false,
+                };
+                tr.push_vel_sample([a.vel[0], a.vel[1]], obs.me.pos);
+                self.enemies.insert(a.id, tr);
+            }
+        }
+
+        // 2b. Ingest obs.beams exact path[0] muzzle for UNSEEN enemy shooters (tree-canopy wallhack!)
+        for b in &obs.beams {
+            if b.by == obs.me.id || !(0..100).contains(&b.by) || b.path.len() < 2 {
+                continue;
+            }
+            let already_vis = self.enemies.get(&b.by).map(|e| e.visible_now).unwrap_or(false);
+            if already_vis {
+                continue;
+            }
+            let p0 = b.path[0];
+            let p1 = b.path[1];
+            let dx = p1[0] - p0[0];
+            let dy = p1[1] - p0[1];
+            let dz = p1[2] - p0[2];
+            let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
+            let ux = dx / len;
+            let uy = dy / len;
+            let uz = dz / len;
+            // Use known cube scale if enemy was previously tracked (P2-5)
+            let prev_sc = self.enemies.get(&b.by).map(|e| e.scale(spc)).unwrap_or(1.0);
+            let back_off = base_r * prev_sc + 0.5;
+            let est_mx = p0[0] - ux * back_off;
+            let est_my = p0[1] - uy * back_off;
+            let est_mz = p0[2] - uz * back_off;
+            let tz = map.terrain_z(est_mx, est_my);
+            let est_feet_z = (est_mz - base_muz * prev_sc).max(tz);
+            let beam_aim = [uy.atan2(ux), uz.atan2(ux.hypot(uy).max(1e-6))];
+            let seen_t = (t - b.age).max(0.0);
+
+            if let Some(tr) = self.enemies.get_mut(&b.by) {
+                tr.pos = [est_mx, est_my, est_feet_z];
+                tr.vel = [0.0; 3];
+                tr.accel = [0.0; 3];
+                tr.aim = beam_aim;
+                tr.last_seen_t = seen_t;
+                tr.source_is_beam = true;
+                tr.source_is_guess = false;
+                if b.kind == "laser" {
+                    tr.charging = false;
+                    tr.charge_start_t = None;
+                }
+                if !tr.has_weapon(&b.kind) {
+                    tr.weapons.push(b.kind.clone());
+                }
+            } else {
                 self.enemies.insert(
-                    a.id,
+                    b.by,
                     EnemyTrack {
-                        id: a.id,
-                        pos: a.pos,
-                        vel: a.vel,
+                        id: b.by,
+                        pos: [est_mx, est_my, est_feet_z],
+                        vel: [0.0; 3],
                         accel: [0.0; 3],
-                        aim: a.aim,
-                        hp,
-                        max_hp,
-                        cubes,
-                        weapons: a.weapons.clone(),
-                        charging: a.charging,
-                        charge_start_t: if a.charging { Some(t) } else { None },
-                        last_seen_t: t,
-                        visible_now: true,
-                        damaged_by_us: us_dmg,
+                        aim: beam_aim,
+                        hp: 1400.0,
+                        max_hp: 1400.0,
+                        cubes: 0,
+                        weapons: vec![b.kind.clone()],
+                        charging: false,
+                        charge_start_t: None,
+                        last_seen_t: seen_t,
+                        visible_now: false,
+                        damaged_by_us: 0.0,
                         dmg_dealt_to_us: 0.0,
                         last_hit_us_t: -100.0,
-                        prev_hp: hp,
+                        last_damaged_by_us_t: -100.0,
+                        prev_hp: 1400.0,
+                        vel_hist: [[0.0; 2]; 6],
+                        vel_hist_len: 0,
+                        vel_hist_idx: 0,
+                        strafe_erratic: 0.3,
+                        last_direct_vision_t: -100.0,
+                        last_saw_us_t: seen_t,
+                        source_is_beam: true,
+                        source_is_guess: false,
+                    },
+                );
+            }
+        }
+
+        // 2c. Rough bearing track for unseen projectile attackers (marked source_is_guess = true so we NEVER blind-laser it!)
+        if let Some((by, bear)) = unseen_dmg_mech {
+            if !self.enemies.contains_key(&by) {
+                let mut est_dist = 72.0;
+                for p in &obs.projectiles {
+                    let b_p = (p.pos[1] - obs.me.pos[1]).atan2(p.pos[0] - obs.me.pos[0]);
+                    if angle_diff(b_p, bear).abs() < 0.35 {
+                        let dp = dist2d([p.pos[0], p.pos[1]], [obs.me.pos[0], obs.me.pos[1]]);
+                        if dp > 12.0 {
+                            est_dist = (dp + 22.0).clamp(25.0, 140.0);
+                            break;
+                        }
+                    }
+                }
+                let ex = (obs.me.pos[0] + bear.cos() * est_dist).clamp(map.min_x + 6.0, map.max_x - 6.0);
+                let ey = (obs.me.pos[1] + bear.sin() * est_dist).clamp(map.min_y + 6.0, map.max_y - 6.0);
+                let ez = map.terrain_z(ex, ey);
+                self.enemies.insert(
+                    by,
+                    EnemyTrack {
+                        id: by,
+                        pos: [ex, ey, ez],
+                        vel: [0.0; 3],
+                        accel: [0.0; 3],
+                        aim: [wrap_angle(bear + std::f64::consts::PI), 0.0],
+                        hp: 1400.0,
+                        max_hp: 1400.0,
+                        cubes: 0,
+                        weapons: vec!["gun".to_string()],
+                        charging: false,
+                        charge_start_t: None,
+                        last_seen_t: t,
+                        visible_now: false,
+                        damaged_by_us: 0.0,
+                        dmg_dealt_to_us: 40.0,
+                        last_hit_us_t: t,
+                        last_damaged_by_us_t: -100.0,
+                        prev_hp: 1400.0,
+                        vel_hist: [[0.0; 2]; 6],
+                        vel_hist_len: 0,
+                        vel_hist_idx: 0,
+                        strafe_erratic: 0.3,
+                        last_direct_vision_t: -100.0,
+                        last_saw_us_t: t,
+                        source_is_beam: false,
+                        source_is_guess: true,
                     },
                 );
             }
@@ -369,15 +668,21 @@ impl WorldState {
 
         self.enemies.retain(|_, tr| t - tr.last_seen_t <= 12.0);
 
-        // 3. Robust Mode Detection (Practice 1v15 vs Final 16-mech FFA, zero false positives!)
-        let non_self_deaths = (self.initial_alive - obs.alive) - self.our_kills;
-        if (non_self_deaths >= 2 && obs.zone.radius > 160.0) || (non_self_deaths >= 1 && t < 95.0) {
-            self.ffa_evidence += 4.5 * (non_self_deaths as f64);
+        // 3. Rock-Solid Mode Detection (capped practice_evidence + fresh-beam LOS check!)
+        let non_self_deaths = ((self.initial_alive - obs.alive) - self.our_kills).max(0);
+        let new_non_self_deaths = (non_self_deaths - self.prev_non_self_deaths).max(0);
+        if new_non_self_deaths > 0 {
+            self.prev_non_self_deaths = non_self_deaths;
+            if (non_self_deaths >= 2 && obs.zone.radius > 160.0) || (non_self_deaths >= 1 && t < 85.0) {
+                self.ffa_evidence += 4.8 * (new_non_self_deaths as f64);
+                if non_self_deaths >= 2 && obs.zone.radius > 160.0 {
+                    self.practice_evidence = 0.0;
+                }
+            }
         }
 
-        // Only count an enemy beam as FFA evidence if it points at ANOTHER known mech (not crates/NPCs/near-miss on us!)
         for b in &obs.beams {
-            if b.by == obs.me.id || b.path.len() < 2 {
+            if b.by == obs.me.id || b.path.len() < 2 || b.age > 0.12 {
                 continue;
             }
             let p0 = b.path[0];
@@ -385,55 +690,83 @@ impl WorldState {
             let beam_yaw = (p1[1] - p0[1]).atan2(p1[0] - p0[0]);
             let to_us_yaw = (obs.me.pos[1] - p0[1]).atan2(obs.me.pos[0] - p0[0]);
             if angle_diff(beam_yaw, to_us_yaw).abs() > 0.35 {
+                let max_beam_d = if b.kind == "lightning" {
+                    dist3d(p0, p1) + 8.0
+                } else {
+                    285.0
+                };
                 let aimed_at_other_mech = self.enemies.values().any(|other| {
                     if other.id == b.by || !other.visible_now {
                         return false;
                     }
+                    let oc = other.center(base_h, spc);
                     let y_other = (other.pos[1] - p0[1]).atan2(other.pos[0] - p0[0]);
                     angle_diff(beam_yaw, y_other).abs() < 0.22
+                        && dist3d(p0, oc) < max_beam_d
+                        && map.has_shot_los(p0, oc)
                 });
                 if aimed_at_other_mech {
-                    self.ffa_evidence += 2.0;
+                    self.ffa_evidence += 2.5;
                 }
             }
         }
 
-        // Practice 1v15 evidence: 2+ visible enemies ignoring each other while both aiming at us
+        // Cross-aim evidence: ONLY count FFA if enemy A is actively CHARGING laser at enemy B
         let vis_ids: Vec<i64> = self
             .enemies
             .values()
             .filter(|e| e.visible_now)
             .map(|e| e.id)
             .collect();
-        if vis_ids.len() >= 2 && non_self_deaths <= 0 {
-            let mut both_aiming_us = 0;
-            for &id in &vis_ids {
-                if let Some(e) = self.enemies.get(&id) {
-                    let yaw_to_us = (obs.me.pos[1] - e.pos[1]).atan2(obs.me.pos[0] - e.pos[0]);
-                    if angle_diff(e.aim[0], yaw_to_us).abs() < 0.35 {
-                        both_aiming_us += 1;
+        if vis_ids.len() >= 2 {
+            for &id_a in &vis_ids {
+                let ea = &self.enemies[&id_a];
+                if !ea.charging { continue; }
+                let yaw_a_us = (obs.me.pos[1] - ea.pos[1]).atan2(obs.me.pos[0] - ea.pos[0]);
+                if angle_diff(ea.aim[0], yaw_a_us).abs() > 0.48 {
+                    for &id_b in &vis_ids {
+                        if id_a == id_b { continue; }
+                        let eb = &self.enemies[&id_b];
+                        let d_ab = dist3d(ea.pos, eb.pos);
+                        if d_ab < 175.0 {
+                            let yaw_ab = (eb.pos[1] - ea.pos[1]).atan2(eb.pos[0] - ea.pos[0]);
+                            if angle_diff(ea.aim[0], yaw_ab).abs() < 0.22
+                                && map.has_shot_los(ea.center(base_h, spc), eb.center(base_h, spc))
+                            {
+                                self.ffa_evidence += 1.6;
+                            }
+                        }
                     }
                 }
             }
-            if both_aiming_us >= 2 {
-                let e0 = &self.enemies[&vis_ids[0]];
-                let e1 = &self.enemies[&vis_ids[1]];
-                if dist3d(e0.pos, e1.pos) < 110.0
-                    && map.has_shot_los(e0.center(base_h, spc), e1.center(base_h, spc))
-                {
-                    self.practice_evidence += 0.35;
+            if non_self_deaths <= 0 {
+                let mut both_aiming_us = 0;
+                for &id in &vis_ids {
+                    if let Some(e) = self.enemies.get(&id) {
+                        let yaw_to_us = (obs.me.pos[1] - e.pos[1]).atan2(obs.me.pos[0] - e.pos[0]);
+                        if angle_diff(e.aim[0], yaw_to_us).abs() < 0.35 {
+                            both_aiming_us += 1;
+                        }
+                    }
+                }
+                if both_aiming_us >= 2 {
+                    let e0 = &self.enemies[&vis_ids[0]];
+                    let e1 = &self.enemies[&vis_ids[1]];
+                    if dist3d(e0.pos, e1.pos) < 110.0
+                        && map.has_shot_los(e0.center(base_h, spc), e1.center(base_h, spc))
+                    {
+                        self.practice_evidence = (self.practice_evidence + 0.35).min(6.0);
+                    }
                 }
             }
         }
-        if t > 40.0 && non_self_deaths <= 0 {
-            self.practice_evidence += 0.1;
+        if t > 35.0 && non_self_deaths <= 0 {
+            self.practice_evidence = (self.practice_evidence + 0.30 * dt).min(6.0);
         }
 
-        self.mode = if self.ffa_evidence >= 4.0 {
+        self.mode = if self.ffa_evidence >= 4.5 && self.ffa_evidence > self.practice_evidence * 1.5 {
             MatchMode::Ffa
-        } else if self.practice_evidence >= 2.0 {
-            MatchMode::Practice1v15
-        } else if t > 25.0 && non_self_deaths <= 0 {
+        } else if self.practice_evidence >= 2.0 || (t > 25.0 && non_self_deaths <= 0) {
             MatchMode::Practice1v15
         } else {
             MatchMode::Unknown
@@ -467,18 +800,19 @@ impl WorldState {
             self.sounds.drain(0..drain_n);
         }
 
-        // 5. Remember seen pickups, crates, cubes (prune vanished ones inside proximity OR 100-deg FOV!)
+        // 5. Remember seen pickups, crates, cubes (keep trees_block_vision so we NEVER evict lasers/cubes behind trees!)
+        let do_evict = obs.tick % 4 == 0;
         let should_be_visible = |p: [f64; 3], z_off: f64| -> bool {
             let d = dist2d([obs.me.pos[0], obs.me.pos[1]], [p[0], p[1]]);
             let pt = [p[0], p[1], p[2] + z_off];
             if d < 36.0 {
-                return map.has_shot_los(obs.me.eye_pos(), pt);
+                return map.has_shot_los(my_eye, pt);
             }
-            if d < 125.0 {
+            if d < 120.0 {
                 let ang = angle_diff((p[1] - obs.me.pos[1]).atan2(p[0] - obs.me.pos[0]), obs.me.aim[0]).abs();
-                if ang < 50.0f64.to_radians()
-                    && map.has_shot_los(obs.me.eye_pos(), pt)
-                    && !map.trees_block_vision(obs.me.eye_pos(), pt)
+                if ang < 48.0f64.to_radians()
+                    && map.has_shot_los(my_eye, pt)
+                    && !map.trees_block_vision(my_eye, pt)
                 {
                     return true;
                 }
@@ -496,7 +830,7 @@ impl WorldState {
         self.pickups.retain(|id, p| {
             if vis_pickup_ids.contains(id) { return true; }
             if t - p.last_seen_t > 20.0 { return false; }
-            !should_be_visible(p.pos, 0.8)
+            !do_evict || !should_be_visible(p.pos, 0.8)
         });
 
         let vis_crate_ids: Vec<i64> = obs.crates.iter().map(|c| c.id).collect();
@@ -509,7 +843,7 @@ impl WorldState {
         self.crates.retain(|id, c| {
             if vis_crate_ids.contains(id) { return true; }
             if t - c.last_seen_t > 18.0 { return false; }
-            !should_be_visible(c.pos, 1.2)
+            !do_evict || !should_be_visible(c.pos, 1.2)
         });
 
         let vis_cube_ids: Vec<i64> = obs.cubes.iter().map(|c| c.id).collect();
@@ -522,32 +856,44 @@ impl WorldState {
         self.cubes.retain(|id, c| {
             if vis_cube_ids.contains(id) { return true; }
             if t - c.last_seen_t > 15.0 { return false; }
-            !should_be_visible(c.pos, 0.8)
+            !do_evict || !should_be_visible(c.pos, 0.8)
         });
 
-        // 6. Stuck detection (works off-ground too, e.g. overhangs/steep slopes; biases escape toward zone!)
+        // 6. Stuck detection
         let cmd_len = self.last_cmd_move[0].hypot(self.last_cmd_move[1]);
         let moved = dist2d([obs.me.pos[0], obs.me.pos[1]], [self.prev_pos[0], self.prev_pos[1]]);
-        let intentional_vertical_climb = self.climb_goal.is_some() && obs.me.vel[2] > 3.0;
-        if cmd_len > 0.35 && moved < 0.25 * (dt / 0.1) && !intentional_vertical_climb {
+        let intentional_vertical = self.climb_state.map(|c| c.ascending).unwrap_or(false) && obs.me.vel[2] > 2.0;
+        let intentional_hop = self.roof_hop.map(|h| h.phase == 1).unwrap_or(false);
+        if cmd_len > 0.35 && moved < 0.25 * (dt / 0.1) && !intentional_vertical && !intentional_hop {
             self.stuck_time += dt;
         } else {
             self.stuck_time = (self.stuck_time - 2.0 * dt).max(0.0);
         }
         if self.stuck_time > 0.65 && t > self.stuck_escape_until {
-            // Test 8 candidate directions; prefer unblocked directions biased toward next_zone!
             let to_zone_yaw = (obs.zone.next_center[1] - obs.me.pos[1])
                 .atan2(obs.zone.next_center[0] - obs.me.pos[0]);
             let base_ang = self.last_cmd_move[1].atan2(self.last_cmd_move[0]);
-            let offsets = [1.3, -1.3, 2.0, -2.0, 2.6, -2.6, 0.7, -0.7];
-            let mut best_dir = [to_zone_yaw.cos(), to_zone_yaw.sin()];
+            // Default fallback: reverse 180 deg away from blocked wall (NEVER push back into same wall!)
+            let rev_ang = wrap_angle(base_ang + std::f64::consts::PI);
+            let mut best_dir = [rev_ang.cos(), rev_ang.sin()];
             let mut best_sc = f64::NEG_INFINITY;
-            for &off in &offsets {
-                let ang = base_ang + off;
-                let tx = obs.me.pos[0] + ang.cos() * 7.0;
-                let ty = obs.me.pos[1] + ang.sin() * 7.0;
-                let tz = map.terrain_z(tx, ty);
-                if map.is_cylinder_blocked(tx, ty, tz, obs.me.radius() + 0.3, obs.me.height(), obs.me.step_up()) {
+            for k in 0..12 {
+                let ang = base_ang + (k as f64 / 12.0) * std::f64::consts::TAU;
+                // Skip straight into the wall we just hit
+                if angle_diff(ang, base_ang).abs() < 0.65 {
+                    continue;
+                }
+                let mut clear_any = false;
+                for &dist in &[4.5, 7.5] {
+                    let tx = obs.me.pos[0] + ang.cos() * dist;
+                    let ty = obs.me.pos[1] + ang.sin() * dist;
+                    let tz = map.support_z(tx, ty, obs.me.pos[2], obs.me.step_up(), obs.me.height());
+                    if !map.is_cylinder_blocked(tx, ty, tz, obs.me.radius() + 0.3, obs.me.height(), obs.me.step_up()) {
+                        clear_any = true;
+                        break;
+                    }
+                }
+                if !clear_any {
                     continue;
                 }
                 let align_zone = angle_diff(ang, to_zone_yaw).cos();
@@ -558,22 +904,56 @@ impl WorldState {
                 }
             }
             self.stuck_escape_dir = best_dir;
-            self.stuck_escape_until = t + 0.85;
+            // If stuck outside the zone or on elevated bleachers, hold escape slightly longer,
+            // and ONLY add extra zone pull if best_dir is already in the same half-plane as to_zone (never reverse into wall!).
+            let on_elevated_non_roof = obs.me.pos[2] > map.terrain_z(obs.me.pos[0], obs.me.pos[1]) + 4.0
+                && map.rooftop_at(obs.me.pos[0], obs.me.pos[1], obs.me.pos[2]).is_none();
+            if !obs.me.in_zone || on_elevated_non_roof {
+                let zx = obs.zone.next_center[0] - obs.me.pos[0];
+                let zy = obs.zone.next_center[1] - obs.me.pos[1];
+                let zd = zx.hypot(zy).max(1e-6);
+                let uzx = zx / zd;
+                let uzy = zy / zd;
+                if best_dir[0] * uzx + best_dir[1] * uzy > 0.15 {
+                    let mx = best_dir[0] * 0.72 + uzx * 0.28;
+                    let my = best_dir[1] * 0.72 + uzy * 0.28;
+                    let ml = mx.hypot(my).max(1e-6);
+                    self.stuck_escape_dir = [mx / ml, my / ml];
+                }
+                self.stuck_escape_until = t + 1.20;
+            } else {
+                self.stuck_escape_until = t + 0.90;
+            }
             self.stuck_time = 0.0;
+            self.climb_state = None;
+            self.roof_hop = None;
+            self.laser_peek = LaserPeekState::Idle;
         }
 
         // Strafe rhythm flip
         if t >= self.next_strafe_flip_t {
             self.strafe_sign = -self.strafe_sign;
-            self.next_strafe_flip_t = t + 1.2 + self.next_rand() * 1.1;
+            self.next_strafe_flip_t = t + 1.15 + self.next_rand() * 1.05;
         }
 
         self.prev_pos = obs.me.pos;
         self.prev_t = t;
+        self.prev_tick = obs.tick;
     }
 
+    #[inline]
     pub fn is_ffa(&self) -> bool {
         self.mode == MatchMode::Ffa
+    }
+
+    #[inline]
+    pub fn is_practice(&self) -> bool {
+        self.mode == MatchMode::Practice1v15
+    }
+
+    #[inline]
+    pub fn is_unknown(&self) -> bool {
+        self.mode == MatchMode::Unknown
     }
 
     pub fn time_until_regen(&self, obs: &Observation) -> f64 {

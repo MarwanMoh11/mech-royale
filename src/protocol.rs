@@ -585,24 +585,37 @@ pub struct WireAction {
 
 impl Action {
     pub fn to_wire_sanitized(&self, min_pitch: f64, max_pitch: f64) -> WireAction {
+        let (lo_p, hi_p) = if min_pitch.is_finite() && max_pitch.is_finite() && min_pitch <= max_pitch {
+            (min_pitch, max_pitch)
+        } else {
+            (-0.7, 1.3)
+        };
         let move_dir = self.move_dir.map(|[mx, my]| {
             let mut x = if mx.is_finite() { mx } else { 0.0 };
             let mut y = if my.is_finite() { my } else { 0.0 };
-            let len = (x * x + y * y).sqrt();
+            let len = x.hypot(y);
             if len > 1.0 {
                 x /= len;
                 y /= len;
             }
-            [round4(x), round4(y)]
+            // Truncate toward zero so post-rounding magnitude NEVER exceeds 1.0!
+            let mut rx = (x * 10000.0).trunc() / 10000.0;
+            let mut ry = (y * 10000.0).trunc() / 10000.0;
+            if rx * rx + ry * ry > 1.0 {
+                let rlen = rx.hypot(ry).max(1.0);
+                rx = ((rx / rlen) * 9999.0).trunc() / 10000.0;
+                ry = ((ry / rlen) * 9999.0).trunc() / 10000.0;
+            }
+            [rx, ry]
         });
         let aim = self.aim.map(|[yaw, pitch]| {
-            let y = if yaw.is_finite() { wrap_angle(yaw) } else { 0.0 };
+            let y = if yaw.is_finite() { round4(wrap_angle(yaw)) } else { 0.0 };
             let p = if pitch.is_finite() {
-                pitch.clamp(min_pitch, max_pitch)
+                round4(pitch.clamp(lo_p, hi_p)).clamp(lo_p, hi_p)
             } else {
-                0.0
+                0.0f64.clamp(lo_p, hi_p)
             };
-            [round4(y), round4(p)]
+            [y, p]
         });
         WireAction {
             tick: self.tick,
@@ -624,7 +637,7 @@ pub fn round4(v: f64) -> f64 {
     if !v.is_finite() {
         return 0.0;
     }
-    (v * 10000.0).round() * 0.0001
+    (v * 10000.0).round() / 10000.0
 }
 
 #[inline]

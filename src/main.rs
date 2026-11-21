@@ -116,6 +116,7 @@ fn main() {
         }
 
         let mut latest_obs: Option<Observation> = None;
+        let mut skipped_kills: i64 = 0;
         let mut should_exit = false;
 
         for item in batch {
@@ -142,7 +143,16 @@ fn main() {
                     );
                 }
                 Ok(ServerMessage::Obs(obs)) => {
-                    latest_obs = Some(obs);
+                    // Preserve mech kill counts from any queued obs we skip so FFA mode detection never false-triggers!
+                    if let Some(prev_obs) = latest_obs.replace(obs) {
+                        for ev in &prev_obs.events {
+                            if ev.kind == "kill"
+                                && ev.target.map(|tid| (0..100).contains(&tid)).unwrap_or(true)
+                            {
+                                skipped_kills += 1;
+                            }
+                        }
+                    }
                 }
                 Ok(ServerMessage::End(_end)) => {
                     should_exit = true;
@@ -158,7 +168,16 @@ fn main() {
             }
         }
 
+        if should_exit {
+            break;
+        }
+
         if let Some(obs) = latest_obs {
+            if skipped_kills > 0 {
+                if let Some(rt) = runtime.as_mut() {
+                    rt.state.our_kills += skipped_kills;
+                }
+            }
             let tick = obs.tick;
             let (min_p, max_p) = runtime
                 .as_ref()
