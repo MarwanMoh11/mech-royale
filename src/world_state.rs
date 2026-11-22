@@ -212,6 +212,7 @@ pub struct WorldState {
     pub last_probe_t: f64,
     // Mode detection (Practice 1v15 vs Final FFA)
     pub ffa_confirmed: bool,
+    pub true_ffa_confirmed: bool,
     pub ffa_evidence: f64,
     pub practice_evidence: f64,
     pub mode: MatchMode,
@@ -275,6 +276,7 @@ impl WorldState {
             laser_peek: LaserPeekState::Idle,
             last_probe_t: -100.0,
             ffa_confirmed: false,
+            true_ffa_confirmed: false,
             ffa_evidence: 0.0,
             practice_evidence: 0.0,
             mode: MatchMode::Unknown,
@@ -355,6 +357,7 @@ impl WorldState {
 
         // 1. Process events
         let mut hit_by_us_ids: Vec<(i64, f64)> = Vec::new();
+        let mut laser_hit_by_ids: Vec<i64> = Vec::new();
         let mut unseen_dmg_mech: Option<(i64, f64)> = None;
         for ev in &obs.events {
             match ev.kind.as_str() {
@@ -367,6 +370,9 @@ impl WorldState {
                         if let Some(by) = ev.by {
                             self.last_damaged_by = Some(by);
                             if (0..100).contains(&by) {
+                                if ev.weapon.as_deref() == Some("laser") {
+                                    laser_hit_by_ids.push(by);
+                                }
                                 if let Some(tr) = self.enemies.get_mut(&by) {
                                     tr.dmg_dealt_to_us += ev.amount.unwrap_or(0.0);
                                     tr.last_hit_us_t = t;
@@ -515,6 +521,7 @@ impl WorldState {
                     // > 175 HP burst inside zone not from us and not from a 25-dmg NPC = confirmed mech-vs-mech FFA!
                     if hp_drop > us_dmg + 175.0 {
                         self.ffa_confirmed = true;
+                        self.true_ffa_confirmed = true;
                     }
                 }
                 tr.prev_hp = tr.hp;
@@ -583,8 +590,33 @@ impl WorldState {
             }
         }
 
-        // 2b. Ingest obs.beams: update enemy laser cooldown for ALL shooters + exact path[0] muzzle for UNSEEN shooters!
+        // 2b. Apply attributed laser hits + sound-associated releases + obs.beams cooldown tracking!
         let enemy_laser_cd = self.config.weapon_f("laser", "cooldown", 1.65);
+        for by in laser_hit_by_ids {
+            if let Some(tr) = self.enemies.get_mut(&by) {
+                tr.laser_ready_t = tr.laser_ready_t.max((t - 0.05).max(0.0) + enemy_laser_cd);
+                tr.charging = false;
+                tr.charge_start_t = None;
+                if !tr.has_weapon("laser") {
+                    tr.weapons.push("laser".to_string());
+                }
+            }
+        }
+        for s in &obs.sounds {
+            if s.kind == "laser" {
+                let fired_t = (t - s.age).max(0.0);
+                for tr in self.enemies.values_mut() {
+                    if t - tr.last_seen_t < 5.0 && tr.has_weapon("laser") {
+                        let b_tr = (tr.pos[1] - obs.me.pos[1]).atan2(tr.pos[0] - obs.me.pos[0]);
+                        if angle_diff(b_tr, s.bearing).abs() < 0.22 {
+                            tr.laser_ready_t = tr.laser_ready_t.max(fired_t + enemy_laser_cd);
+                            tr.charging = false;
+                            tr.charge_start_t = None;
+                        }
+                    }
+                }
+            }
+        }
         for b in &obs.beams {
             if b.by == obs.me.id || !(0..100).contains(&b.by) || b.path.len() < 2 {
                 continue;
@@ -735,6 +767,12 @@ impl WorldState {
         let non_self_deaths = ((self.initial_alive - obs.alive) - self.our_kills).max(0);
         if non_self_deaths > self.prev_non_self_deaths {
             self.prev_non_self_deaths = non_self_deaths;
+        }
+        if (non_self_deaths >= 2 && t < 115.0)
+            || (non_self_deaths >= 3 && t < 155.0)
+            || (non_self_deaths >= 1 && t < 75.0 && obs.zone.radius > 300.0)
+        {
+            self.true_ffa_confirmed = true;
         }
         if (non_self_deaths >= 1 && obs.zone.radius > 110.0) || non_self_deaths >= 2 {
             self.ffa_confirmed = true;
@@ -934,6 +972,11 @@ impl WorldState {
     #[inline]
     pub fn is_ffa(&self) -> bool {
         self.mode == MatchMode::Ffa
+    }
+
+    #[inline]
+    pub fn is_true_ffa(&self) -> bool {
+        self.true_ffa_confirmed
     }
 
     #[inline]
