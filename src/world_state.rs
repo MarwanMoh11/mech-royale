@@ -512,9 +512,12 @@ impl WorldState {
                     && !tr.source_is_guess
                 {
                     tr.external_dmg_t = t;
-                    // > 175 HP burst inside zone not from us and not from a 25-dmg NPC = confirmed mech-vs-mech FFA!
-                    if hp_drop > us_dmg + 175.0 {
-                        self.ffa_confirmed = true;
+                    // Only count non-mortar-self-splash bursts (> 220 HP) as evidence, never 1-tick false-latch Practice -> FFA!
+                    if hp_drop > us_dmg + 220.0 && !a.has_weapon("mortar") {
+                        self.ffa_evidence += 1.0;
+                        if self.ffa_evidence >= 2.0 {
+                            self.ffa_confirmed = true;
+                        }
                     }
                 }
                 tr.prev_hp = tr.hp;
@@ -731,12 +734,17 @@ impl WorldState {
 
         self.enemies.retain(|_, tr| t - tr.last_seen_t <= 12.0);
 
-        // 3. Rock-Solid Death & Unattributed-Burst Mode Detection (ZERO false Practice->FFA flips from house bots shooting crates/NPCs!)
+        // 3. Rock-Solid Death & Multi-Burst Mode Detection (ZERO false Practice->FFA flips from mortar self-splash or 1-2 late zone/NPC deaths!)
         let non_self_deaths = ((self.initial_alive - obs.alive) - self.our_kills).max(0);
         if non_self_deaths > self.prev_non_self_deaths {
             self.prev_non_self_deaths = non_self_deaths;
         }
-        if (non_self_deaths >= 1 && obs.zone.radius > 110.0) || non_self_deaths >= 2 {
+        // In 16-mech FFA, mechs die early (<55s before zone even shrinks, or 2+ deaths while zone > 140m, or 4+ total).
+        // In Practice 1v15, squadmates never fight each other; 1-2 late zone/NPC deaths must NEVER flip Practice into passive FFA!
+        if (non_self_deaths >= 1 && t < 55.0)
+            || (non_self_deaths >= 2 && obs.zone.radius > 140.0)
+            || non_self_deaths >= 4
+        {
             self.ffa_confirmed = true;
         }
         self.mode = if self.ffa_confirmed {
