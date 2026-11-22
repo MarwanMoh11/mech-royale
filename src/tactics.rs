@@ -171,9 +171,13 @@ pub fn decide_weapon_pickup(
         if already_has(kind) {
             return None;
         }
-        // NEVER pick up Mortar in Practice OR FFA (+60% enemy laser cookoff = 504..1474 dmg instant death + 350m sound beacon!)
+        // Practice unarmed bridge: pick up Mortar into empty slot 1 when !have_laser & no Laser threat nearby
+        // (rains 360-dmg concussive shells over walls, instantly swapped for Laser/Lightning or dropped if Laser threat appears!)
         if kind == "mortar" {
-            return None;
+            if state.is_ffa() || already_has("laser") || enemy_laser_los_close || (s0.is_some() && s1.is_some()) {
+                return None;
+            }
+            return Some((125.0, None));
         }
 
         if s0.is_none() || s1.is_none() {
@@ -435,7 +439,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         let has_lt = e.has_weapon("lightning");
         let has_ls = e.has_weapon("laser");
         if has_lt && d < 52.0 && (e.visible_now || t - e.last_seen_t < 1.5) { enemy_lightning_within_52 = true; }
-        if has_ls && los && d < 220.0 { enemy_laser_los_close = true; }
+        if has_ls && ((los && d < 285.0) || d < 110.0) { enemy_laser_los_close = true; }
         visible_enemies.push(EnemySummary {
             id: e.id,
             pos: e.pos,
