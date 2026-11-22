@@ -1568,7 +1568,6 @@ fn pick_tactical_position(
 
         let cand_muz = [cand[0], cand[1], cand[2] + my_muz_h];
         let cand_upper = [cand[0], cand[1], cand[2] + my_h * 0.78];
-        let cand_center = [cand[0], cand[1], cand[2] + my_h * 0.50];
         let mut sc = 0.0;
 
         let dc_fut = dist2d([cand[0], cand[1]], z_future_c);
@@ -1606,7 +1605,6 @@ fn pick_tactical_position(
 
         let mut exposed = 0usize;
         let mut primary_los = false;
-        let mut primary_hull_down = false;
         let mut primary_dist = 100.0;
         let mut min_enemy_d = f64::INFINITY;
         let mut charging_los = 0usize;
@@ -1627,7 +1625,6 @@ fn pick_tactical_position(
             }
             if Some(e.id) == primary_id {
                 primary_los = map.has_shot_los(cand_muz, e.center);
-                primary_hull_down = primary_los && !map.has_shot_los(e.muzzle, cand_center);
                 primary_dist = d;
             }
         }
@@ -1641,12 +1638,9 @@ fn pick_tactical_position(
             sc -= (charging_los as f64) * 130.0;
             sc += min_enemy_d.min(95.0) * 0.7;
         } else {
-            // Strict 1v1 sightline slicing + hard-cover adjacency + hull-down center-mass shield (real bots aim center mass!)
-            if exposed <= 1 && primary_los {
+            // Strict 1v1 sightline slicing + hard-cover adjacency bonus (0.5s step behind cover! Fable #2)
+            if exposed == 1 && primary_los {
                 sc += if want_peek { 205.0 } else { 160.0 };
-                if primary_hull_down {
-                    sc += 55.0;
-                }
                 if let Some(pe) = primary_enemy {
                     // Check if 7m perpendicular step reaches hard cover from primary enemy!
                     let to_e = (pe.pos[1] - cand[1]).atan2(pe.pos[0] - cand[0]);
@@ -1762,7 +1756,7 @@ fn pick_macro_hold_spot(
                 let d_me = dist2d([me.pos[0], me.pos[1]], [x, y]);
                 let cov = map.cover_at([x, y]) as f64;
                 let mut sc = cov * 115.0 - d_me * 0.35;
-                if d_me < 8.0 && cov >= 0.25 {
+                if d_me < 8.0 && cov >= 0.55 {
                     sc += 24.0; // Hysteresis: hold our dense cover corner instead of jittering!
                 }
                 if state.is_ffa() || me.hp < me.max_hp * 0.78 {

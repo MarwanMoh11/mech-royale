@@ -756,28 +756,50 @@ impl ArenaMap {
             }
         }
 
-        // Precompute cover score (fraction of 8 neighbors that are building walls!)
+        // Precompute true 16-bearing 3D raycast sightline occlusion field (Opus #2 Fortress Pockets):
+        // rewards cells shielded from long Laser lanes & open avenues with an adjacent <20m bait_charge wall!
+        let mut dirs16 = [[0.0f64; 2]; 16];
+        for (k, d) in dirs16.iter_mut().enumerate() {
+            let ang = (k as f64 / 16.0) * std::f64::consts::TAU;
+            *d = [ang.cos(), ang.sin()];
+        }
         for iy in 1..self.nav_ny.saturating_sub(1) {
+            let y = self.nav_min_y + iy as f64 * NAV_STEP;
             for ix in 1..self.nav_nx.saturating_sub(1) {
                 let idx = iy * self.nav_nx + ix;
                 if !self.nav_walkable[idx] {
                     continue;
                 }
-                let mut adj_wall = 0.0f32;
-                for dy in -2i32..=2 {
-                    for dx in -2i32..=2 {
-                        if dx == 0 && dy == 0 { continue; }
-                        let nx = ix as i32 + dx;
-                        let ny = iy as i32 + dy;
-                        if nx >= 0 && nx < self.nav_nx as i32 && ny >= 0 && ny < self.nav_ny as i32 {
-                            if !self.nav_walkable[ny as usize * self.nav_nx + nx as usize] {
-                                let d2 = (dx * dx + dy * dy) as f32;
-                                adj_wall += 1.0 / d2;
-                            }
-                        }
+                let x = self.nav_min_x + ix as f64 * NAV_STEP;
+                let origin = [x, y, self.nav_z[idx] + 6.5];
+                let mut blocked_close = 0u32;
+                let mut open_mid = 0u32;
+                let mut open_long = 0u32;
+                for d in &dirs16 {
+                    let hit_t = self
+                        .raycast_solid(origin, [d[0], d[1], 0.0], 150.0)
+                        .map(|h| h.t)
+                        .unwrap_or(150.0);
+                    if hit_t < 20.0 {
+                        blocked_close += 1;
+                    }
+                    if hit_t >= 35.0 {
+                        open_mid += 1;
+                    }
+                    if hit_t >= 95.0 {
+                        open_long += 1;
                     }
                 }
-                self.nav_cover[idx] = adj_wall.min(4.0) * 0.25;
+                let close_shield = (16.0 - open_mid as f64) / 16.0;
+                let sniper_shield = (16.0 - open_long as f64) / 16.0;
+                let duck_bonus = if blocked_close >= 2 { 0.14 } else { 0.0 };
+                let pocket_bonus = if (1..=6).contains(&open_mid) && open_long <= 3 && blocked_close >= 3 {
+                    0.16
+                } else {
+                    0.0
+                };
+                self.nav_cover[idx] = (close_shield * 0.55 + sniper_shield * 0.45 + duck_bonus + pocket_bonus)
+                    .clamp(0.0, 1.25) as f32;
             }
         }
     }
