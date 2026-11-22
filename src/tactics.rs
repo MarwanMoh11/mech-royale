@@ -120,7 +120,7 @@ pub fn pick_upgrade(offer: &Offer, obs: &Observation, state: &WorldState) -> usi
             "gun_rate" => if have_gun { if have_laser { 96.0 } else { 102.0 } } else { 18.0 },
             "gun_damage" => if have_gun { if have_laser { 94.0 } else { 100.0 } } else { 18.0 },
             "gun_velocity" => if have_gun { if have_laser { 76.0 } else { 82.0 } } else { 15.0 },
-            "sensors" => if is_ffa { 96.0 } else { 70.0 },
+            "sensors" => if stacks == 0 { if is_ffa { 140.0 } else { 148.0 } } else { 130.0 },
             "gyros" => 76.0,
             "laser_pierce" => if have_laser { if is_ffa { 54.0 } else { 80.0 } } else { 18.0 },
             "mortar_reload" => if have_mortar { 76.0 } else { 15.0 },
@@ -661,8 +661,88 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
     }
 
-    // 6. Active Dodge + Combat Decision
+    // 6. Active Dodge + Corner Pre-Charge LaserPeekState FSM + Combat Decision
     let dodge = compute_dodge(obs, state, map);
+    let my_ls = find_weapon_slot(me, "laser").and_then(|s| me.weapons[s].as_ref());
+    let my_ls_cd = my_ls.map(|w| w.cooldown).unwrap_or(99.0);
+    let my_ls_chg = my_ls.and_then(|w| w.charge).unwrap_or(0.0);
+    let my_ls_full = my_ls.map(|w| w.stat("charge", 0.75)).unwrap_or(0.75);
+    let mut peek_precharge_id: Option<i64> = None;
+    let mut peek_goal_override: Option<[f64; 3]> = None;
+    let mut peek_boost_override = false;
+    if !have_laser || state.is_laser_shorted(t) || cur_roof.is_some() || state.healing_mode || enemy_lightning_within_52 || dodge.mortar_blast_pos.is_some() {
+        state.laser_peek = crate::world_state::LaserPeekState::Idle;
+    } else {
+        match state.laser_peek {
+            crate::world_state::LaserPeekState::Idle => {
+                if my_ls_cd <= 0.12 && my_ls_chg <= 0.0 && enemies_with_los == 0 {
+                    if let Some(pe) = visible_enemies.iter().filter(|e| !e.has_los && e.dist >= 24.0 && e.dist <= 255.0 && !(e.has_lightning && e.dist < 52.0)).min_by(|a, b| a.hp.partial_cmp(&b.hp).unwrap_or(std::cmp::Ordering::Equal)) {
+                        let pairs = map.corner_peek_pairs(me.pos, pe.muzzle, pe.center, me.radius(), me.height(), me.muzzle_height(), me.step_up(), obs.zone.center, obs.zone.radius);
+                        let mut best_p: Option<(f64, [f64; 3], [f64; 3], f64)> = None;
+                        for (cov, pk) in pairs {
+                            let dm = dist2d([me.pos[0], me.pos[1]], [cov[0], cov[1]]);
+                            let ds = dist2d([cov[0], cov[1]], [pk[0], pk[1]]);
+                            if dm <= 6.0 && ds <= 5.5
+                                && !visible_enemies.iter().any(|o| o.id != pe.id && o.dist < 185.0 && map.is_cylinder_exposed_to(o.muzzle, pk, me.radius(), me.height()))
+                                && !visible_enemies.iter().any(|o| o.dist < 185.0 && map.is_cylinder_exposed_to(o.muzzle, cov, me.radius(), me.height()))
+                            {
+                                let sc = -dm * 1.5 - ds * 2.0;
+                                if best_p.map(|(bs, _, _, _)| sc > bs).unwrap_or(true) {
+                                    best_p = Some((sc, cov, pk, ds));
+                                }
+                            }
+                        }
+                        if let Some((_, cov, pk, ds)) = best_p {
+                            state.laser_peek = crate::world_state::LaserPeekState::ChargeInCover {
+                                target_id: pe.id, cover_pos: cov, peek_pos: pk, d_edge: ds, started_t: t,
+                            };
+                        }
+                    }
+                }
+            }
+            crate::world_state::LaserPeekState::ChargeInCover { target_id, cover_pos, peek_pos, d_edge, started_t } => {
+                let pe_opt = visible_enemies.iter().find(|e| e.id == target_id);
+                let cov_bad = visible_enemies.iter().any(|o| o.dist < 185.0 && map.is_cylinder_exposed_to(o.muzzle, cover_pos, me.radius(), me.height()));
+                if pe_opt.is_none() || cov_bad || t - started_t > 2.2 || enemies_with_los >= 2 {
+                    state.laser_peek = crate::world_state::LaserPeekState::Idle;
+                } else {
+                    let pe = pe_opt.unwrap();
+                    peek_goal_override = Some(cover_pos);
+                    if dist2d([me.pos[0], me.pos[1]], [cover_pos[0], cover_pos[1]]) <= 2.6 {
+                        peek_precharge_id = Some(target_id);
+                    }
+                    let v_pk = if me.energy > 14.0 { me.boost_speed() * 0.5 } else { me.walk_speed() * 0.5 };
+                    let t_mv = (d_edge / v_pk.max(4.0)).clamp(0.18, 0.52);
+                    let t_rem = (my_ls_full - my_ls_chg).max(0.0);
+                    let enemy_bait_hold = pe.charging && my_ls_chg < my_ls_full + 1.0;
+                    if my_ls_chg >= 0.08 && !enemy_bait_hold && t_rem <= t_mv + 0.06 {
+                        state.laser_peek = crate::world_state::LaserPeekState::PeekOut {
+                            target_id, cover_pos, peek_pos, started_t: t,
+                        };
+                    }
+                }
+            }
+            crate::world_state::LaserPeekState::PeekOut { target_id, cover_pos, peek_pos, started_t } => {
+                if my_ls_chg <= 0.0 && my_ls_cd > 0.25 {
+                    state.laser_peek = crate::world_state::LaserPeekState::SnapBack { cover_pos, until_t: t + 0.45 };
+                } else if t - started_t > 0.75 || enemies_with_los >= 2 {
+                    state.laser_peek = crate::world_state::LaserPeekState::SnapBack { cover_pos, until_t: t + 0.35 };
+                } else {
+                    peek_precharge_id = Some(target_id);
+                    peek_goal_override = Some(peek_pos);
+                    if me.energy > 12.0 { peek_boost_override = true; }
+                }
+            }
+            crate::world_state::LaserPeekState::SnapBack { cover_pos, until_t } => {
+                if t >= until_t || dist2d([me.pos[0], me.pos[1]], [cover_pos[0], cover_pos[1]]) <= 1.2 {
+                    state.laser_peek = crate::world_state::LaserPeekState::Idle;
+                } else {
+                    peek_goal_override = Some(cover_pos);
+                    if enemies_with_los >= 1 && me.energy > 12.0 { peek_boost_override = true; }
+                }
+            }
+        }
+    }
     let combat = decide_combat(
         obs,
         state,
@@ -672,7 +752,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         farm_npc_id,
         &dodge,
         dropped_only_slot,
-        None,
+        peek_precharge_id,
     );
     act.fire = Some(combat.fire);
     if combat.reload {
@@ -848,6 +928,9 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
     } else if let Some(hop) = state.roof_hop {
         goal_3d = if hop.phase == 0 { hop.from_pos } else { hop.to_pos };
+    } else if let Some(pg) = peek_goal_override {
+        goal_3d = pg;
+        if peek_boost_override { want_boost = true; }
     } else if let Some(dp) = finishing_drop_pos {
         goal_3d = dp;
     } else if let Some(cs) = state.climb_state {
@@ -1045,7 +1128,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
     } else {
         goal_3d = pick_macro_hold_spot(obs, state, map, cur_roof, margin_cur, ready_for_rooftops);
-        let active_hunt_boost = !is_ffa && have_laser && hp_frac >= 0.78 && !state.healing_mode && obs.zone.radius > 75.0 && obs.alive > 2;
+        let active_hunt_boost = false;
         if (!have_laser || active_hunt_boost) && state.travel_boost_active {
             want_boost = true;
         }
@@ -1481,8 +1564,10 @@ fn pick_tactical_position(
     let zone_in_stadium = in_stadium_zone(obs.zone.next_center[0], obs.zone.next_center[1]);
     let primary_enemy = primary_id.and_then(|pid| enemies.iter().find(|e| e.id == pid));
 
+    let sens_stacks = count_upgrade(me, "sensors");
     let preferred_dist = if have_laser {
-        if !state.is_ffa() && enemies.len() >= 2 { (obs.zone.radius * 0.85).clamp(118.0, 152.0) } else { 118.0 }
+        let target_d = if sens_stacks >= 2 { 225.0 } else if sens_stacks == 1 { 205.0 } else { 172.0 };
+        (obs.zone.radius * 0.88).clamp(115.0, target_d)
     } else if have_light {
         66.0
     } else {
@@ -1756,8 +1841,15 @@ fn pick_tactical_position(
                 sc -= (52.0 - d) * 11.5;
             }
             if map.has_shot_los(e.muzzle, cand_upper) {
-                exposed += 1;
-                if e.charging { charging_los += 1; }
+                let e_eye = [e.pos[0], e.pos[1], e.muzzle[2] + 1.0];
+                let tree_blind = state.config.vision.canopy_blocks && !e.charging && d > 48.0
+                    && map.mech_vision_blocked(e_eye, cand, my_h);
+                if !tree_blind {
+                    exposed += 1;
+                    if e.charging { charging_los += 1; }
+                } else {
+                    sc += 35.0;
+                }
             }
             if Some(e.id) == primary_id {
                 primary_los = map.has_shot_los(cand_muz, e.center);
@@ -1818,7 +1910,7 @@ fn pick_tactical_position(
             }
 
             let range_err = (primary_dist - preferred_dist).abs();
-            sc -= range_err * 0.45;
+            sc -= range_err * 0.78;
             if !have_light && min_enemy_d < 26.0 {
                 sc -= (26.0 - min_enemy_d) * 6.5;
             }
@@ -1899,7 +1991,7 @@ fn pick_macro_hold_spot(
     if !ready_for_rooftops {
         let have_laser = find_weapon_slot(me, "laser").is_some();
         // Active Phase 0-1 Perimeter Hunt in Practice: break the Phase 2-3 deathball by hunting drop holders & isolated sounds!
-        let active_hunt = !state.is_ffa()
+        let active_hunt = false && !state.is_ffa()
             && have_laser
             && !state.healing_mode
             && me.hp >= me.max_hp * 0.78
