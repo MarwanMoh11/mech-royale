@@ -541,38 +541,19 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         .map(|e| if e.has_laser { 131.0 } else { 65.0 } + 55.0)
         .sum::<f64>()
         .max(1.0);
-    let laser_obs = find_weapon_slot(me, "laser")
-        .and_then(|s| me.weapons.get(s))
-        .and_then(|w| w.as_ref());
-    let my_laser_wait = laser_obs
-        .map(|w| {
-            let full = w.stat("charge", 0.75);
-            let chg = w.charge.unwrap_or(0.0);
-            if chg > 0.0 {
-                (full - chg).max(0.05)
-            } else {
-                w.cooldown.max(0.0) + full
-            }
-        })
-        .unwrap_or(99.0);
     let best_duel_target = visible_enemies
         .iter()
-        .filter(|e| e.has_los)
+        .filter(|e| e.has_los || e.dist < 65.0)
         .min_by(|a, b| a.hp.partial_cmp(&b.hp).unwrap_or(std::cmp::Ordering::Equal));
-    // Fix critical heal-cancel bug: ONLY kill-commit when enemies_with_los == 1 on an ACTUAL shootable target with real Laser timing!
     let kill_commit = !is_ffa
         && me.in_zone
-        && enemies_with_los == 1
+        && enemies_with_los <= 1
         && me.hp > 380.0
         && best_duel_target
             .map(|e| {
-                let ttk = if have_laser && e.hp <= 315.0 * dmg_mult {
-                    my_laser_wait
-                } else {
-                    e.hp / our_dps.max(40.0)
-                };
+                let ttk = if have_laser && e.hp <= 315.0 * dmg_mult { 0.6 } else { e.hp / our_dps.max(40.0) };
                 let ttd = me.hp / incoming_dps;
-                ttk < 0.60 * ttd || (e.hp < e.max_hp * 0.35 && e.dist < 85.0 && ttk < 1.6)
+                ttk < 0.60 * ttd || (e.hp < e.max_hp * 0.35 && e.dist < 85.0)
             })
             .unwrap_or(false);
 
@@ -1196,10 +1177,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
     }
 
-    if dodge.urgency >= 2.5 && me.in_zone && !zone_urgent && !in_air_hop {
-        // Pure full-speed corner duck / mortar blast evasion on the VERY FIRST tick!
-        move_vec = dodge.vec;
-    } else if dodge.urgency > 0.1 && !in_air_hop {
+    if dodge.urgency > 0.1 && !in_air_hop {
         let dw = dodge.urgency.clamp(0.5, 3.2);
         move_vec[0] += dodge.vec[0] * dw;
         move_vec[1] += dodge.vec[1] * dw;
@@ -1231,7 +1209,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         && state.climb_state.is_none()
         && state.roof_hop.is_none()
         && !stuck_air_ok
-        && dz_goal <= 2.5
+        && dz_goal <= 0.3
     {
         want_boost = false;
     }

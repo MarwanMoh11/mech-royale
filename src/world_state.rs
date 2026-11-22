@@ -367,19 +367,9 @@ impl WorldState {
                         if let Some(by) = ev.by {
                             self.last_damaged_by = Some(by);
                             if (0..100).contains(&by) {
-                                let is_laser_hit = ev.weapon.as_deref() == Some("laser");
-                                let enemy_laser_cd = self.config.weapon_f("laser", "cooldown", 1.65);
                                 if let Some(tr) = self.enemies.get_mut(&by) {
                                     tr.dmg_dealt_to_us += ev.amount.unwrap_or(0.0);
                                     tr.last_hit_us_t = t;
-                                    if is_laser_hit {
-                                        tr.laser_ready_t = tr.laser_ready_t.max(t + enemy_laser_cd);
-                                        tr.charging = false;
-                                        tr.charge_start_t = None;
-                                        if !tr.has_weapon("laser") {
-                                            tr.weapons.push("laser".to_string());
-                                        }
-                                    }
                                 } else {
                                     unseen_dmg_mech = Some((by, b));
                                 }
