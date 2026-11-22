@@ -83,10 +83,6 @@ pub struct EnemyTrack {
     pub source_is_guess: bool,
     pub laser_ready_t: f64,
     pub external_dmg_t: f64,
-    pub gun_reload_until: f64,
-    pub gun_burst_shots: u8,
-    pub last_gun_shot_t: f64,
-    pub heard_charge_t: f64,
 }
 
 impl EnemyTrack {
@@ -218,7 +214,6 @@ pub struct WorldState {
     pub last_probe_t: f64,
     // Mode detection (Practice 1v15 vs Final FFA)
     pub ffa_confirmed: bool,
-    pub true_ffa_confirmed: bool,
     pub ffa_evidence: f64,
     pub practice_evidence: f64,
     pub mode: MatchMode,
@@ -250,8 +245,6 @@ pub struct WorldState {
     pub next_strafe_flip_t: f64,
     pub scan_yaw: f64,
     pub rng_state: u64,
-    pub seen_proj_ids: [i64; 32],
-    pub seen_proj_idx: usize,
 }
 
 impl WorldState {
@@ -286,7 +279,6 @@ impl WorldState {
             laser_peek: LaserPeekState::Idle,
             last_probe_t: -100.0,
             ffa_confirmed: false,
-            true_ffa_confirmed: false,
             ffa_evidence: 0.0,
             practice_evidence: 0.0,
             mode: MatchMode::Unknown,
@@ -314,8 +306,6 @@ impl WorldState {
             next_strafe_flip_t: 1.5,
             scan_yaw: 0.0,
             rng_state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
-            seen_proj_ids: [-1; 32],
-            seen_proj_idx: 0,
         }
     }
 
@@ -329,14 +319,14 @@ impl WorldState {
     }
 
     pub fn mark_visited(&mut self, x: f64, y: f64, t: f64) {
-        let gx = (((x + 515.0) / 67.0).floor() as isize).clamp(0, 15) as usize;
-        let gy = (((y + 335.0) / 61.0).floor() as isize).clamp(0, 11) as usize;
+        let gx = (((x + 440.0) / 55.0).floor() as isize).clamp(0, 15) as usize;
+        let gy = (((y + 340.0) / 56.67).floor() as isize).clamp(0, 11) as usize;
         self.visited_sectors[gy * 16 + gx] = t;
     }
 
     pub fn sector_visited_t(&self, x: f64, y: f64) -> f64 {
-        let gx = (((x + 515.0) / 67.0).floor() as isize).clamp(0, 15) as usize;
-        let gy = (((y + 335.0) / 61.0).floor() as isize).clamp(0, 11) as usize;
+        let gx = (((x + 440.0) / 55.0).floor() as isize).clamp(0, 15) as usize;
+        let gy = (((y + 340.0) / 56.67).floor() as isize).clamp(0, 11) as usize;
         self.visited_sectors[gy * 16 + gx]
     }
 
@@ -369,7 +359,6 @@ impl WorldState {
 
         // 1. Process events
         let mut hit_by_us_ids: Vec<(i64, f64)> = Vec::new();
-        let mut laser_hit_by_ids: Vec<i64> = Vec::new();
         let mut unseen_dmg_mech: Option<(i64, f64)> = None;
         for ev in &obs.events {
             match ev.kind.as_str() {
@@ -384,9 +373,6 @@ impl WorldState {
                         if let Some(by) = ev.by {
                             self.last_damaged_by = Some(by);
                             if (0..100).contains(&by) {
-                                if ev.weapon.as_deref() == Some("laser") {
-                                    laser_hit_by_ids.push(by);
-                                }
                                 if let Some(tr) = self.enemies.get_mut(&by) {
                                     tr.dmg_dealt_to_us += ev.amount.unwrap_or(0.0);
                                     tr.last_hit_us_t = t;
@@ -535,7 +521,6 @@ impl WorldState {
                     // > 175 HP burst inside zone not from us and not from a 25-dmg NPC = confirmed mech-vs-mech FFA!
                     if hp_drop > us_dmg + 175.0 {
                         self.ffa_confirmed = true;
-                        self.true_ffa_confirmed = true;
                     }
                 }
                 tr.prev_hp = tr.hp;
@@ -600,92 +585,14 @@ impl WorldState {
                     source_is_guess: false,
                     laser_ready_t: -10.0,
                     external_dmg_t: -100.0,
-                    gun_reload_until: -10.0,
-                    gun_burst_shots: 0,
-                    last_gun_shot_t: -100.0,
-                    heard_charge_t: -100.0,
                 };
                 tr.push_vel_sample([a.vel[0], a.vel[1]], obs.me.pos);
                 self.enemies.insert(a.id, tr);
             }
         }
 
-        // 2b. Apply attributed laser hits + sound-associated releases + obs.beams cooldown tracking!
+        // 2b. Ingest obs.beams: update enemy laser cooldown for ALL shooters + exact path[0] muzzle for UNSEEN shooters!
         let enemy_laser_cd = self.config.weapon_f("laser", "cooldown", 1.65);
-        for by in laser_hit_by_ids {
-            if let Some(tr) = self.enemies.get_mut(&by) {
-                tr.laser_ready_t = tr.laser_ready_t.max((t - 0.05).max(0.0) + enemy_laser_cd);
-                tr.charging = false;
-                tr.charge_start_t = None;
-                if !tr.has_weapon("laser") {
-                    tr.weapons.push("laser".to_string());
-                }
-            }
-        }
-        let enemy_gun_reload = self.config.weapon_f("gun", "reload", 2.4);
-        for s in &obs.sounds {
-            if s.kind == "reload" {
-                let start_t = (t - s.age).max(0.0);
-                let mut best: Option<(i64, f64)> = None;
-                for tr in self.enemies.values() {
-                    if t - tr.last_seen_t < 4.5 && tr.has_weapon("gun") {
-                        let d_tr = dist2d([tr.pos[0], tr.pos[1]], [obs.me.pos[0], obs.me.pos[1]]);
-                        if d_tr < 68.0 {
-                            let err = angle_diff((tr.pos[1] - obs.me.pos[1]).atan2(tr.pos[0] - obs.me.pos[0]), s.bearing).abs();
-                            if err < 0.26 && best.map(|(_, be)| err < be).unwrap_or(true) { best = Some((tr.id, err)); }
-                        }
-                    }
-                }
-                if let Some((uid, _)) = best {
-                    if let Some(tr) = self.enemies.get_mut(&uid) {
-                        tr.gun_reload_until = tr.gun_reload_until.max(start_t + enemy_gun_reload);
-                        tr.gun_burst_shots = 0;
-                    }
-                }
-            } else if s.kind == "laser_charge" {
-                let start_t = (t - s.age).max(0.0);
-                for tr in self.enemies.values_mut() {
-                    if t - tr.last_seen_t < 4.5 && tr.has_weapon("laser") && !tr.visible_now {
-                        let d_tr = dist2d([tr.pos[0], tr.pos[1]], [obs.me.pos[0], obs.me.pos[1]]);
-                        let err = angle_diff((tr.pos[1] - obs.me.pos[1]).atan2(tr.pos[0] - obs.me.pos[0]), s.bearing).abs();
-                        if d_tr < 148.0 && err < 0.24 { tr.heard_charge_t = tr.heard_charge_t.max(start_t); }
-                    }
-                }
-            } else if s.kind == "laser" {
-                let fired_t = (t - s.age).max(0.0);
-                let mut best_id: Option<(i64, f64)> = None;
-                let mut n_match = 0usize;
-                for tr in self.enemies.values() {
-                    if t - tr.last_seen_t < 5.0 && tr.has_weapon("laser") {
-                        let d_tr = dist2d([tr.pos[0], tr.pos[1]], [obs.me.pos[0], obs.me.pos[1]]);
-                        let bucket_ok = match s.dist.as_str() {
-                            "near" => d_tr < 78.0,
-                            "mid" => (42.0..=185.0).contains(&d_tr),
-                            _ => d_tr > 135.0,
-                        };
-                        let b_tr = (tr.pos[1] - obs.me.pos[1]).atan2(tr.pos[0] - obs.me.pos[0]);
-                        let err = angle_diff(b_tr, s.bearing).abs();
-                        if bucket_ok && err < 0.22 {
-                            n_match += 1;
-                            if best_id.map(|(_, be)| err < be).unwrap_or(true) {
-                                best_id = Some((tr.id, err));
-                            }
-                        }
-                    }
-                }
-                if n_match == 1 {
-                    if let Some((uid, _)) = best_id {
-                        if let Some(tr) = self.enemies.get_mut(&uid) {
-                            tr.laser_ready_t = tr.laser_ready_t.max(fired_t + enemy_laser_cd);
-                            if !tr.visible_now {
-                                tr.charging = false;
-                                tr.charge_start_t = None;
-                            }
-                        }
-                    }
-                }
-            }
-        }
         for b in &obs.beams {
             if b.by == obs.me.id || !(0..100).contains(&b.by) || b.path.len() < 2 {
                 continue;
@@ -772,49 +679,11 @@ impl WorldState {
                         source_is_guess: false,
                         laser_ready_t: if b.kind == "laser" { fired_t + enemy_laser_cd } else { -10.0 },
                         external_dmg_t: -100.0,
-                    gun_reload_until: -10.0,
-                    gun_burst_shots: 0,
-                    last_gun_shot_t: -100.0,
-                    heard_charge_t: -100.0,
                     },
                 );
             }
         }
 
-        let gun_mag = self.config.weapon_f("gun", "mag", 12.0).round().max(6.0) as u8;
-        for p in &obs.projectiles {
-            if p.kind != "gun" || self.seen_proj_ids.contains(&p.id) { continue; }
-            self.seen_proj_ids[self.seen_proj_idx] = p.id;
-            self.seen_proj_idx = (self.seen_proj_idx + 1) % self.seen_proj_ids.len();
-            let pspd = (p.vel[0]*p.vel[0] + p.vel[1]*p.vel[1] + p.vel[2]*p.vel[2]).sqrt().max(1.0);
-            let (vx, vy) = (p.vel[0] / pspd, p.vel[1] / pspd);
-            let mut best_shooter: Option<(i64, f64)> = None;
-            for tr in self.enemies.values() {
-                if !tr.visible_now || !tr.has_weapon("gun") { continue; }
-                let dx = p.pos[0] - tr.pos[0]; let dy = p.pos[1] - tr.pos[1];
-                let along = dx * vx + dy * vy; let perp = (dx * (-vy) + dy * vx).abs();
-                if (2.0..=36.0).contains(&along) && perp < 3.2 && best_shooter.map(|(_, ba)| along < ba).unwrap_or(true) {
-                    best_shooter = Some((tr.id, along));
-                }
-            }
-            if let Some((sid, _)) = best_shooter {
-                if let Some(tr) = self.enemies.get_mut(&sid) {
-                    if t - tr.last_gun_shot_t > 2.1 { tr.gun_burst_shots = 0; }
-                    tr.gun_reload_until = -10.0;
-                    tr.gun_burst_shots = tr.gun_burst_shots.saturating_add(1);
-                    tr.last_gun_shot_t = t;
-                }
-            }
-        }
-        for tr in self.enemies.values_mut() {
-            if tr.visible_now && tr.gun_burst_shots >= gun_mag.saturating_sub(1) && t > tr.gun_reload_until {
-                let gap = t - tr.last_gun_shot_t;
-                if (0.55..=1.1).contains(&gap) {
-                    tr.gun_reload_until = tr.last_gun_shot_t + enemy_gun_reload;
-                    tr.gun_burst_shots = 0;
-                }
-            }
-        }
         // 2c. Rough bearing track for unseen projectile attackers (marked source_is_guess = true so we NEVER blind-laser it!)
         if let Some((by, bear)) = unseen_dmg_mech {
             if !self.enemies.contains_key(&by) {
@@ -863,10 +732,6 @@ impl WorldState {
                         source_is_guess: true,
                         laser_ready_t: -10.0,
                         external_dmg_t: -100.0,
-                    gun_reload_until: -10.0,
-                    gun_burst_shots: 0,
-                    last_gun_shot_t: -100.0,
-                    heard_charge_t: -100.0,
                     },
                 );
             }
@@ -883,9 +748,9 @@ impl WorldState {
             || (non_self_deaths >= 3 && t < 155.0)
             || (non_self_deaths >= 1 && t < 75.0 && obs.zone.radius > 300.0)
         {
-            self.true_ffa_confirmed = true;
+            self.ffa_confirmed = true;
         }
-        if self.true_ffa_confirmed
+        if self.ffa_confirmed
             || (non_self_deaths >= 1 && obs.zone.radius > 165.0 && t < 110.0)
             || (non_self_deaths >= 2 && t < 165.0)
         {
@@ -1087,11 +952,6 @@ impl WorldState {
     #[inline]
     pub fn is_ffa(&self) -> bool {
         self.mode == MatchMode::Ffa
-    }
-
-    #[inline]
-    pub fn is_true_ffa(&self) -> bool {
-        self.true_ffa_confirmed
     }
 
     #[inline]

@@ -41,7 +41,7 @@ fn is_roof_climbable(
             return false;
         }
         let climb_dh = (ep.pos[2] - ep.drop_z).max(0.0);
-        if climb_dh > max_h || climb_dh > 52.0 {
+        if climb_dh > max_h || climb_dh > 50.0 {
             return false;
         }
         let e_need = (climb_dh / (rise * 0.94)).max(0.5) * me.jet_drain() + 10.0;
@@ -73,8 +73,8 @@ fn target_pos_reachable(
 
 /// Cube farming cap: 10 cubes (hits stat_cap=10 + 4th upgrade @10 while avoiding 15-cube hitbox bloat!)
 #[inline]
-fn cube_farm_cap(state: &WorldState) -> i64 {
-    if state.is_true_ffa() { 10 } else { 15 }
+fn cube_farm_cap(_state: &WorldState) -> i64 {
+    10
 }
 
 pub fn pick_upgrade(offer: &Offer, obs: &Observation, state: &WorldState) -> usize {
@@ -211,7 +211,7 @@ pub fn decide_weapon_pickup(
         // Late-game close quarters (next_radius <= 70 or radius <= 85): swap Gun -> Lightning! (Opus #7 — drops broken energy_ups gate!)
         if kind == "lightning" && already_has("laser") && already_has("gun") {
             let mid_gunfight = enemies_with_los >= 1 && nearest_enemy_d > 48.0;
-            let close_endgame = obs.zone.next_radius <= 70.0 || obs.zone.radius <= 85.0 || (state.is_true_ffa() && obs.alive <= 4 && obs.zone.radius <= 145.0);
+            let close_endgame = obs.zone.next_radius <= 70.0 || obs.zone.radius <= 85.0;
             if !mid_gunfight && close_endgame && gun_ups <= 2 {
                 let gun_slot = if w0.kind == "gun" { 0 } else { 1 };
                 return Some((130.0, Some(gun_slot)));
@@ -265,10 +265,10 @@ pub fn decide_weapon_pickup(
             let dz = (p.pos[2] - me.pos[2]).max(0.0);
             let on_other_roof = p.pos[2] > map.terrain_z(p.pos[0], p.pos[1]) + 2.5
                 && cur_roof != map.rooftop_at(p.pos[0], p.pos[1], p.pos[2]);
-            if on_other_roof && (enemies_with_los >= 1 || nearest_enemy_d < 22.0 || (!is_laser && me.energy < 45.0)) {
+            if on_other_roof && !is_laser && me.energy < 45.0 {
                 continue;
             }
-            let sc = val - d * 1.05 - dz * 1.5 - if on_other_roof { 18.0 } else { 0.0 };
+            let sc = val - d * 1.05 - dz * 1.1;
             if is_laser {
                 if best_laser_goal.map(|(bs, _)| sc > bs).unwrap_or(true) {
                     best_laser_goal = Some((sc, p.pos));
@@ -320,9 +320,6 @@ struct EnemySummary {
     has_laser: bool,
     #[allow(dead_code)]
     laser_ready_t: f64,
-    gun_reload_until: f64,
-    charge_elapsed: f64,
-    heard_charge_t: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -441,7 +438,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         if e.visible_now && e.charging { any_enemy_charging = true; }
         let has_lt = e.has_weapon("lightning");
         let has_ls = e.has_weapon("laser");
-        if has_lt && d < 60.0 && (e.visible_now || t - e.last_seen_t < 1.5) { enemy_lightning_within_52 = true; }
+        if has_lt && d < 52.0 && (e.visible_now || t - e.last_seen_t < 1.5) { enemy_lightning_within_52 = true; }
         if has_ls && los && d < 220.0 { enemy_laser_los_close = true; }
         visible_enemies.push(EnemySummary {
             id: e.id,
@@ -456,9 +453,6 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             has_lightning: has_lt,
             has_laser: has_ls,
             laser_ready_t: e.laser_ready_t,
-            gun_reload_until: e.gun_reload_until,
-            charge_elapsed: e.charge_elapsed(t),
-            heard_charge_t: e.heard_charge_t,
         });
     }
 
@@ -482,9 +476,6 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
                     has_lightning: false,
                     has_laser: false,
                     laser_ready_t: -10.0,
-                    gun_reload_until: -10.0,
-                    charge_elapsed: 0.0,
-                    heard_charge_t: -100.0,
                 });
                 enemies_with_los += 1;
                 enemies_within_115 += 1;
@@ -509,7 +500,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     );
     act.take = take_id;
     act.drop = drop_slot;
-    let dropped_only_slot = drop_slot;
+    let dropped_only_slot = if take_id.is_none() { drop_slot } else { None };
 
     // 4. Movement-Only Heal Hysteresis Latch (breaks LOS to heal 56%->88% Prac / 72%->90% FFA,
     //    while NEVER blocking Laser/Gun/Lightning if an enemy actually pushes into LOS!)
@@ -606,8 +597,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
 
     // Regen hygiene (Opus #4): don't shoot crates while hurt (<90% HP) unless we still lack Laser/2nd weapon!
     let crate_regen_ok = hp_frac >= 0.90 || missing_second_weapon || !have_laser;
-    let crate_safe_d = if !have_laser { 36.0 } else { 55.0 };
-    if me.in_zone && enemies_with_los == 0 && nearest_enemy_d > crate_safe_d && (want_more_cubes || missing_second_weapon || !have_laser) {
+    if me.in_zone && enemies_with_los == 0 && nearest_enemy_d > 55.0 && (want_more_cubes || missing_second_weapon || !have_laser) {
         if crate_regen_ok {
             let crate_max_d = if me.cubes < 6 || missing_second_weapon || !have_laser { 135.0 } else { 80.0 };
             let mut best_c_score = f64::NEG_INFINITY;
@@ -789,17 +779,11 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     let mut chosen_hop: Option<RoofHop> = None;
 
     let safe_for_quick_cube = want_more_cubes && hp_frac > 0.65 && !any_enemy_charging && !enemy_lightning_within_52;
-    let laser_close_dash = !have_laser
-        && desired_pickup_is_laser
-        && hp_frac > 0.22
-        && desired_pickup_pos.map(|p| dist2d([me.pos[0], me.pos[1]], [p[0], p[1]]) < 28.0 && (p[2] - me.pos[2]).abs() < 4.5).unwrap_or(false);
+    let laser_close_dash = !have_laser && desired_pickup_is_laser && hp_frac > 0.22
+        && !any_enemy_charging && !enemy_lightning_within_52
+        && desired_pickup_pos.map(|p| dist2d([me.pos[0], me.pos[1]], [p[0], p[1]]) < 42.0 && (p[2] - me.pos[2]).abs() < 4.5).unwrap_or(false);
     let laser_loot_priority = laser_close_dash
-        || (!have_laser
-            && hp_frac > 0.36
-            && enemies_with_los <= 1
-            && !enemy_lightning_within_52
-            && desired_pickup_is_laser
-            && desired_pickup_pos.is_some());
+        || (!have_laser && hp_frac > 0.36 && enemies_with_los <= 1 && !enemy_lightning_within_52 && desired_pickup_is_laser && desired_pickup_pos.is_some());
     let kill_drop_laser_search = !have_laser
         && desired_pickup_pos.is_none()
         && hp_frac > 0.42
@@ -815,7 +799,6 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     let confirmed_kill_laser = kill_drop_laser_search && state.last_kill_drop_pos.map(|(_, _, hl)| hl).unwrap_or(false);
     let urgent_heal_drop = hp_frac < 0.78 && best_drop_pos.is_some() && enemies_with_los == 0;
     let mut goal_is_laser_pickup = false;
-    let mut precharge_aim: Option<[f64; 2]> = None;
 
     if zone_urgent {
         goal_3d = find_safe_zone_target(obs, map, margin_cur);
@@ -830,11 +813,6 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         goal_3d = dp;
     } else if let Some(cs) = state.climb_state {
         goal_3d = if cs.ascending { cs.edge_pos } else { [cs.launch_xy[0], cs.launch_xy[1], map.terrain_z(cs.launch_xy[0], cs.launch_xy[1])] };
-        if !cs.ascending {
-            let climb_dh = (cs.edge_pos[2] - map.terrain_z(cs.launch_xy[0], cs.launch_xy[1])).max(0.0);
-            let e_need = ((climb_dh / (rise_speed * 0.94)).max(0.5) * me.jet_drain() + 12.0).min(me.max_energy - 2.0);
-            if me.energy > e_need + 14.0 && dist2d([me.pos[0], me.pos[1]], cs.launch_xy) > 8.0 { want_boost = true; }
-        }
     } else if laser_loot_priority {
         goal_3d = desired_pickup_pos.unwrap();
         goal_is_laser_pickup = true;
@@ -859,13 +837,6 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     {
         goal_3d = best_cube_pos.unwrap();
         if me.energy > 30.0 { want_boost = true; }
-    } else if best_drop_pos.is_some()
-        && enemies_with_los == 0
-        && (hp_frac < 0.74 || me.cubes < 12)
-        && best_drop_pos.map(|dp| dist2d([me.pos[0], me.pos[1]], [dp[0], dp[1]]) < 145.0).unwrap_or(false)
-    {
-        goal_3d = best_drop_pos.unwrap();
-        if me.energy > 28.0 { want_boost = true; }
     } else if !visible_enemies.is_empty()
         && (enemies_with_los >= 1
             || nearest_enemy_d < (if have_laser { 95.0 } else { 42.0 })
@@ -887,37 +858,31 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         // Peek-Fire-Hide against ACTUAL Laser holders (denies real Expert bots' 315-dmg Laser during our 1.65s CD!)
         let enemy_laser_ready_soon = visible_enemies
             .iter()
-            .any(|e| e.has_los && e.has_laser && e.laser_ready_t <= t + 1.15);
+            .any(|e| e.has_los && e.has_laser && e.laser_ready_t <= t + 0.85);
         // Opus #5: Offensive Laser Punish-Window Peek — step out immediately after an enemy wastes its Laser
         // (e.g. into our wall after bait_charge!) while our Laser is ready and no other Laser holder threatens us!
-        let next_threat_s = |e: &EnemySummary| -> f64 {
-            if e.charging { (0.72 - e.charge_elapsed).max(0.05) }
-            else if t - e.heard_charge_t < 0.85 { 0.25 }
-            else if e.has_lightning && e.dist < 50.0 { 0.0 }
-            else if e.has_laser { (e.laser_ready_t - t).max(0.0) + 0.72 }
-            else if e.gun_reload_until > t + 0.10 { e.gun_reload_until - t }
-            else { 0.24 }
-        };
-        let active_threat_los = visible_enemies.iter().filter(|e| e.has_los && next_threat_s(e) < 0.78).count();
-        let primary_punishable = combat
+        let primary_laser_on_cd = combat
             .target_enemy_id
             .and_then(|pid| visible_enemies.iter().find(|e| e.id == pid))
-            .map(|e| !e.charging && (t - e.heard_charge_t) > 0.85 && ((e.has_laser && (e.laser_ready_t - t) >= 0.85) || (!e.has_laser && (e.gun_reload_until - t) >= 1.05)))
+            .map(|e| e.has_laser && (e.laser_ready_t - t) >= 0.85)
             .unwrap_or(false);
-        let other_imminent_threat = visible_enemies.iter().any(|e| {
-            Some(e.id) != combat.target_enemy_id && e.has_los && next_threat_s(e) < 0.85
+        let other_ready_laser_threat = visible_enemies.iter().any(|e| {
+            Some(e.id) != combat.target_enemy_id
+                && e.has_los
+                && e.has_laser
+                && e.laser_ready_t <= t + 0.85
         });
         let punish_peek = have_laser
             && !state.is_laser_shorted(t)
             && (combat.laser_cd <= 0.15 || combat.charging_laser)
-            && primary_punishable
-            && !other_imminent_threat
+            && primary_laser_on_cd
+            && !other_ready_laser_threat
             && !need_heal
-            && active_threat_los <= 1;
+            && enemies_with_los <= 1;
         let laser_cd_cover = have_laser
             && !kill_commit
             && !combat.charging_laser
-            && combat.laser_cd > 0.55
+            && combat.laser_cd > 0.60
             && enemies_with_los >= 1
             && enemy_laser_ready_soon
             && (hp_frac < 0.90 || enemies_with_los >= 2);
@@ -929,10 +894,10 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             || (is_ffa && obs.alive > 4 && hp_frac < 0.85 && visible_enemies.iter().all(|e| e.hp > 700.0)))
             && !losing_hp_race
             && !kill_commit
-            && !(combat.want_peek && enemies_with_los <= 1 && !state.healing_mode)
+            && !combat.want_peek
             && !punish_peek;
 
-        let laser_sweep_target = None;
+        let laser_sweep_target = if !have_laser && !want_cover_only { if desired_pickup_is_laser { desired_pickup_pos } else { None } } else { None };
 
         let chosen = pick_tactical_position(
             obs,
@@ -967,52 +932,6 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
 
         let escaping_lightning = enemy_lightning_within_52 && !have_light;
-        // Surgical Pre-Charged Corner Peek (Opus #1 + GPT-6.2 #2): charge behind cover when stepping <= 9.0m into predicted LOS!
-        if !state.is_true_ffa()
-            && have_laser
-            && !want_cover_only
-            && !combat.charging_laser
-            && !state.is_laser_shorted(t)
-            && combat.laser_cd <= 0.10
-            && enemies_with_los == 0
-            && !escaping_lightning
-            && dodge.urgency < 2.5
-            && me.in_zone
-        {
-            if let Some(ls_slot) = find_weapon_slot(me, "laser") {
-                if Some(ls_slot) != dropped_only_slot {
-                    let gd = dist2d([me.pos[0], me.pos[1]], [goal_3d[0], goal_3d[1]]);
-                    if gd >= 1.8 && gd <= 9.0 {
-                        if let Some(pid) = combat.target_enemy_id {
-                            if let Some(tr) = state.enemies.get(&pid) {
-                                if tr.visible_now && !tr.charging && !tr.source_is_beam && !tr.source_is_guess {
-                                    let ec = tr.center(base_h, spc);
-                                    let ec_fut = [ec[0] + tr.vel[0] * 0.45, ec[1] + tr.vel[1] * 0.45, ec[2]];
-                                    let goal_muz = [goal_3d[0], goal_3d[1], goal_3d[2] + me.muzzle_height()];
-                                    let ed = dist3d(goal_muz, ec_fut);
-                                    if ed <= 265.0
-                                        && ed >= 34.0
-                                        && map.has_shot_los(goal_muz, ec)
-                                        && map.has_shot_los(goal_muz, ec_fut)
-                                    {
-                                        let mut f = act.fire.unwrap_or([false, false]);
-                                        f[ls_slot] = true;
-                                        act.fire = Some(f);
-                                        let pdx = ec_fut[0] - goal_muz[0];
-                                        let pdy = ec_fut[1] - goal_muz[1];
-                                        let pdz = ec_fut[2] - goal_muz[2];
-                                        precharge_aim = Some([pdy.atan2(pdx), pdz.atan2(pdx.hypot(pdy).max(1e-6))]);
-                                        if me.energy > 18.0 {
-                                            want_boost = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
         if (enemies_with_los >= 2 || reload_retreat || gun_only_outnumbered || laser_cd_cover || (need_heal && enemies_with_los >= 1) || escaping_lightning)
             && me.energy > 16.0
         {
@@ -1073,22 +992,15 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         if !have_laser && me.energy > 12.0 {
             want_boost = true;
         }
-        if have_laser && (state.is_ffa() || me.hp < me.max_hp * 0.75) && dist2d([me.pos[0], me.pos[1]], [goal_3d[0], goal_3d[1]]) < 12.0 {
+        if have_laser && dist2d([me.pos[0], me.pos[1]], [goal_3d[0], goal_3d[1]]) < 12.0 {
             stealth_walk = true;
             want_boost = false;
-        }
-        if !state.is_ffa() && have_laser && me.hp >= me.max_hp * 0.78 && me.energy > 32.0 {
-            if let Some(s) = state.sounds.iter().rev().find(|s| t - s.t < 2.2 && s.dist_est <= 165.0 && dist2d(s.est_pos, obs.zone.next_center) < obs.zone.next_radius) {
-                let tz = map.terrain_z(s.est_pos[0], s.est_pos[1]);
-                goal_3d = [s.est_pos[0], s.est_pos[1], tz];
-                want_boost = true;
-            }
         }
     }
 
     // 9. Initiate Edge-Launch Climb when safe & ready_for_rooftops (or chasing a climbable rooftop Laser)!
     let min_climb_enemy_d = if goal_is_laser_pickup {
-        22.0
+        20.0
     } else if !is_ffa && have_laser && hp_frac > 0.52 && me.energy > 50.0 {
         26.0
     } else {
@@ -1150,31 +1062,11 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
 
     let stuck_overhang = map.is_covered_above(me.pos[0], me.pos[1], me.pos[2] + me.height() - 0.5, 4.0);
     let on_elevated_non_roof = me.pos[2] > map.terrain_z(me.pos[0], me.pos[1]) + 4.0 && cur_roof.is_none();
-    let stadium_rim_hop = zone_urgent
-        && !in_stadium_zone(obs.zone.next_center[0], obs.zone.next_center[1])
-        && me.pos[0] > -274.0
-        && me.pos[0] < -236.0
-        && me.pos[1] > -12.5
-        && me.pos[1] <= 5.5
-        && me.pos[2] >= 13.0;
-    let stuck_air_ok = stadium_rim_hop
-        || (t < state.stuck_escape_until
-            && !stuck_overhang
-            && (state.stuck_streak < 4 || on_elevated_non_roof)
-            && (enemies_with_los == 0 || !me.in_zone || on_elevated_non_roof));
-    if stadium_rim_hop {
-        let tx = (-255.0 - me.pos[0]).clamp(-6.0, 6.0) * 0.08;
-        let vlen = tx.hypot(1.0);
-        move_vec = [tx / vlen, -1.0 / vlen];
-        if me.pos[2] < 24.5 && me.energy > 8.0 {
-            if me.grounded {
-                want_jump = true;
-                want_boost = false;
-            } else {
-                want_boost = true;
-            }
-        }
-    } else if t < state.stuck_escape_until {
+    let stuck_air_ok = t < state.stuck_escape_until
+        && !stuck_overhang
+        && (state.stuck_streak < 4 || on_elevated_non_roof)
+        && (enemies_with_los == 0 || !me.in_zone || on_elevated_non_roof);
+    if t < state.stuck_escape_until {
         move_vec = state.stuck_escape_dir;
         if stuck_air_ok && me.energy > 14.0 {
             if me.grounded {
@@ -1302,22 +1194,6 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             move_vec[0] += rep[0] * 0.7;
             move_vec[1] += rep[1] * 0.7;
         }
-    } else if enemies_with_los >= 1 && !zone_urgent && !final_circle && dodge.urgency < 0.2 {
-        if let Some(pe) = combat.target_enemy_id.and_then(|pid| visible_enemies.iter().find(|e| e.id == pid)) {
-            let to_e = (pe.pos[1] - me.pos[1]).atan2(pe.pos[0] - me.pos[0]);
-            for &sgn in &[state.strafe_sign, -state.strafe_sign] {
-                let ang = to_e + sgn * std::f64::consts::FRAC_PI_2;
-                let px = me.pos[0] + ang.cos() * 3.5;
-                let py = me.pos[1] + ang.sin() * 3.5;
-                let pz = map.support_z(px, py, me.pos[2], me.step_up(), me.height());
-                if dist2d([px, py], obs.zone.center) < obs.zone.radius - 3.0
-                    && !map.is_cylinder_blocked(px, py, pz, me.radius() + 0.3, me.height(), me.step_up())
-                {
-                    move_vec = [ang.cos(), ang.sin()];
-                    break;
-                }
-            }
-        }
     } else if cur_roof.is_some() && !zone_urgent && !final_circle && dodge.urgency < 0.2 {
         // Anti-mortar micro-pacing on rooftops: never stand dead still for blind mortars!
         if let Some(r_idx) = cur_roof {
@@ -1334,7 +1210,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
     }
 
-    if dodge.urgency >= 2.5 && me.in_zone && !zone_urgent && !in_air_hop {
+    if dodge.urgency >= 3.0 && me.in_zone && !zone_urgent && !in_air_hop {
         // Pure full-speed corner duck / mortar blast evasion — no diagonal drag from tactical goal!
         move_vec = dodge.vec;
     } else if dodge.urgency > 0.1 && !in_air_hop {
@@ -1344,14 +1220,9 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     }
 
     let mlen = move_vec[0].hypot(move_vec[1]);
-    let near_final_pin_lock = final_circle && me.in_zone && dist_to_next_center < 5.0;
-    let ls_firing = find_weapon_slot(me, "laser").map(|s| act.fire.unwrap_or([false, false])[s]).unwrap_or(false);
     // Boost while charging laser when moving (Opus #1 — matches real Expert 9.75 m/s charge-boost!)
-    if (combat.charging_laser || ls_firing) && mlen > 0.1 && me.energy > 18.0 && !stealth_walk && !near_final_pin_lock {
+    if combat.charging_laser && mlen > 0.1 && me.energy > 22.0 && !stealth_walk {
         want_boost = true;
-    }
-    if near_final_pin_lock && me.grounded && dodge.urgency < 2.5 {
-        want_boost = false;
     }
     if mlen > 1e-6 {
         let climbing_asc = state.climb_state.map(|c| c.ascending).unwrap_or(false);
@@ -1374,13 +1245,13 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         && state.climb_state.is_none()
         && state.roof_hop.is_none()
         && !stuck_air_ok
-        && dz_goal <= (if state.is_true_ffa() { 2.5 } else { 0.3 })
+        && dz_goal <= 0.3
     {
         want_boost = false;
     }
 
     // 11. Smooth 360-deg scan fallback (fast full-360 sweep when hunting Laser!)
-    let final_aim = if let Some(a) = precharge_aim.or(combat.aim) {
+    let final_aim = if let Some(a) = combat.aim {
         a
     } else if !have_laser {
         state.scan_yaw = wrap_angle(me.aim[0] + 1.15);
@@ -1439,15 +1310,10 @@ fn find_safe_zone_target(obs: &Observation, map: &ArenaMap, margin_cur: f64) -> 
     // Ohio Stadium horseshoe escape: when zone is outside the Stadium, exit via the open south mouth (-275, 12)
     // or walk south around west wall p[235] via (-395, 48) — eliminates ALL Stadium zone deaths (m24/m25/m29)!
     if !in_stadium_zone(nc[0], nc[1]) {
-        // Tight Stadium bowl + south bleacher p[221] rim hop (excludes east outside corridor x > -222!)
-        if me.pos[0] > -354.0 && me.pos[0] < -222.0 && me.pos[1] > 4.0 && me.pos[1] < 256.0 {
-            let ex = -255.0;
-            let ey = 0.0;
-            return [ex, ey, map.terrain_z(ex, ey)];
-        }
-        if me.pos[0] > -274.0 && me.pos[0] < -236.0 && me.pos[1] > -12.5 && me.pos[1] <= 4.0 && me.pos[2] >= 13.0 {
-            let ex = -255.0;
-            let ey = -24.0;
+        // Inside the Stadium bowl / east bleacher rim
+        if me.pos[0] > -358.0 && me.pos[0] < -174.0 && me.pos[1] > 35.0 && me.pos[1] < 258.0 {
+            let ex = -275.0;
+            let ey = 12.0;
             return [ex, ey, map.terrain_z(ex, ey)];
         }
         // Directly behind west Stadium wall p[235] (x=[-382.2,-352.2], y=[74.3,221.8]) trying to go east
@@ -1530,11 +1396,11 @@ fn pick_tactical_position(
     let primary_enemy = primary_id.and_then(|pid| enemies.iter().find(|e| e.id == pid));
 
     let preferred_dist = if have_laser {
-        114.0
+        if !state.is_ffa() && enemies.len() >= 2 { (obs.zone.radius * 0.85).clamp(118.0, 152.0) } else { 118.0 }
     } else if have_light {
-        32.0
+        34.0
     } else {
-        72.0
+        76.0
     };
 
     let mut candidates: Vec<MoveCandidate> = Vec::with_capacity(48);
@@ -1613,8 +1479,7 @@ fn pick_tactical_position(
             }
         }
     } else {
-        let rings: &[(f64, usize)] = &[(4.8, 10usize), (10.5, 10usize), (22.0, 12usize), (40.0, 10usize)];
-        for &(rad, count) in rings {
+        for &(rad, count) in &[(4.8, 10usize), (10.5, 10usize), (22.0, 12usize), (40.0, 10usize)] {
             for k in 0..count {
                 let ang = (k as f64 / count as f64) * std::f64::consts::TAU;
                 let cx = me.pos[0] + ang.cos() * rad;
@@ -1633,31 +1498,6 @@ fn pick_tactical_position(
             }
         }
 
-        // Anti-Pincer Pack-Kite: when 2+ enemies converge, generate 55-75m rotation points AWAY from threat centroid!
-        if enemies.len() >= 2 {
-            let mut sx = 0.0; let mut sy = 0.0; let mut sw = 0.0;
-            for e in enemies.iter().filter(|e| e.dist < 145.0) {
-                let w = (155.0 - e.dist).max(10.0);
-                sx += e.pos[0] * w; sy += e.pos[1] * w; sw += w;
-            }
-            if sw > 1.0 {
-                let cx_e = sx / sw; let cy_e = sy / sw;
-                let away_ang = (me.pos[1] - cy_e).atan2(me.pos[0] - cx_e);
-                for &off in &[0.0, 0.45, -0.45, 0.95, -0.95] {
-                    let ang = away_ang + off;
-                    for &rad in &[52.0, 72.0] {
-                        let kx = (me.pos[0] + ang.cos() * rad).clamp(map.min_x + 10.0, map.max_x - 10.0);
-                        let ky = (me.pos[1] + ang.sin() * rad).clamp(map.min_y + 10.0, map.max_y - 10.0);
-                        let kz = map.terrain_z(kx, ky);
-                        if map.terrain_slope_deg(kx, ky) < 44.0
-                            && !map.is_cylinder_blocked(kx, ky, kz, my_r + 0.4, my_h, me.step_up())
-                        {
-                            candidates.push(MoveCandidate::Pos([kx, ky, kz]));
-                        }
-                    }
-                }
-            }
-        }
         // Building-shadow cover candidates up to 115m away whenever multiple enemies or seeking cover!
         if want_cover_only || enemies.len() >= 2 {
             if let Some(nearest_e) = enemies.iter().min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal)) {
@@ -1811,8 +1651,8 @@ fn pick_tactical_position(
             if on_rooftop && (e.pos[2] - me.pos[2]).abs() < 4.5 && d < 38.0 {
                 enemies_on_my_height += 1;
             }
-            if e.has_lightning && !have_light && d < 62.0 {
-                sc -= (62.0 - d) * 13.0;
+            if e.has_lightning && !have_light && d < 52.0 {
+                sc -= (52.0 - d) * 11.5;
             }
             if map.has_shot_los(e.muzzle, cand_upper) {
                 exposed += 1;
@@ -1852,21 +1692,6 @@ fn pick_tactical_position(
                     if near_hard_cover {
                         sc += 48.0;
                     }
-                    // Opus 5.5 #2 Center-Mass Hull-Down: real server beams aim 0.50h while our muzzle shoots from 0.78h!
-                    let cand_center = [cand[0], cand[1], cand[2] + my_h * 0.50];
-                    if !map.has_shot_los(pe.muzzle, cand_center) {
-                        sc += 135.0;
-                    }
-                    // PROTOCOL §8 TREE-SCREEN ONE-WAY SNIPER: past 50m, dense trees block enemy vision (center & top) while letting OUR 315-dmg Laser shoot straight through!
-                    // Fast short-circuit: only test top ray if center ray is blocked by trees (and reuse solid LOS!).
-                    if !state.is_true_ffa() && primary_dist > 50.0 && primary_dist < 195.0 && (sc + 260.0 > best_score) {
-                        let pe_eye = [pe.pos[0], pe.pos[1], pe.pos[2] + 8.0];
-                        let cand_top = [cand[0], cand[1], cand[2] + my_h];
-                        let mid_vis_blocked = map.trees_block_vision(pe_eye, cand_center) || !map.has_shot_los(pe_eye, cand_center);
-                        if mid_vis_blocked && (map.trees_block_vision(pe_eye, cand_top) || !map.has_shot_los(pe_eye, cand_top)) {
-                            sc += 165.0;
-                        }
-                    }
                 }
             } else if exposed == 0 {
                 sc += if want_peek { 35.0 } else { 110.0 };
@@ -1876,7 +1701,7 @@ fn pick_tactical_position(
                 sc -= ((exposed - 1) as f64) * 275.0;
             }
             sc -= (charging_los as f64) * 85.0;
-            if state.is_true_ffa() && obs.alive == 3 && active_enemies.len() >= 2 {
+            if state.is_ffa() && obs.alive == 3 && active_enemies.len() >= 2 {
                 let e0 = active_enemies[0]; let e1 = active_enemies[1];
                 let (dx0, dy0) = (e0.pos[0] - cand[0], e0.pos[1] - cand[1]);
                 let (dx1, dy1) = (e1.pos[0] - cand[0], e1.pos[1] - cand[1]);
@@ -1917,21 +1742,6 @@ fn pick_tactical_position(
         let move_d = dist2d([cand[0], cand[1]], [me.pos[0], me.pos[1]]);
         let dz = (cand[2] - me.pos[2]).max(0.0);
         sc -= move_d * 0.28 + dz * 0.70;
-        // Midpoint crossing-lane exposure penalty (GPT-6.2-sol #2: don't sprint across 2+ firing lanes to reach cover!)
-        if move_d > 14.0 && active_enemies.len() >= 2 {
-            let mid_x = 0.5 * (me.pos[0] + cand[0]);
-            let mid_y = 0.5 * (me.pos[1] + cand[1]);
-            let mid_z = map.terrain_z(mid_x, mid_y) + my_h * 0.78;
-            let mut mid_exp = 0usize;
-            for e in &active_enemies {
-                if map.has_shot_los(e.muzzle, [mid_x, mid_y, mid_z]) {
-                    mid_exp += 1;
-                }
-            }
-            if mid_exp >= 2 {
-                sc -= (mid_exp - 1) as f64 * 95.0;
-            }
-        }
 
         if let Some(prev_g) = state.last_tactical_goal {
             if dist2d([cand[0], cand[1]], [prev_g[0], prev_g[1]]) < 9.0 {
@@ -1982,7 +1792,7 @@ fn pick_macro_hold_spot(
     // Phase B (have_laser): HOLD a dense building-cover corner inside next_zone instead of patrolling open streets! (Fable #4)
     if !ready_for_rooftops {
         let have_laser = find_weapon_slot(me, "laser").is_some();
-        if have_laser && (state.is_ffa() || me.hp < me.max_hp * 0.75) {
+        if have_laser {
             let mut best_hold: Option<(f64, [f64; 3])> = None;
             let hold_max_r = (nr * 0.68).clamp(18.0, 155.0);
             let mut eval_spot = |x: f64, y: f64| {
@@ -2039,30 +1849,14 @@ fn pick_macro_hold_spot(
         }
 
         let mut best_sw: Option<(f64, [f64; 3])> = None;
-        let mut sweep_pts: Vec<[f64; 2]> = Vec::with_capacity(32);
-        for &(lr, cnt) in &[(55.0, 8usize), (110.0, 8usize)] {
-            for k in 0..cnt {
-                let ang = (k as f64 / cnt as f64) * std::f64::consts::TAU;
-                sweep_pts.push([
-                    (me.pos[0] + ang.cos() * lr).clamp(map.min_x + 12.0, map.max_x - 12.0),
-                    (me.pos[1] + ang.sin() * lr).clamp(map.min_y + 12.0, map.max_y - 12.0),
-                ]);
-            }
-        }
         let max_r = (nr * 0.72).clamp(30.0, 210.0);
         for ring in 0..2 {
             let r_f = if ring == 0 { 0.45 } else { 0.85 };
             let sweep_r = (max_r * r_f).max(24.0);
             for step in 0..8 {
                 let ang = (step as f64 / 8.0) * std::f64::consts::TAU + (ring as f64) * 0.39;
-                sweep_pts.push([
-                    (nc[0] + ang.cos() * sweep_r).clamp(map.min_x + 12.0, map.max_x - 12.0),
-                    (nc[1] + ang.sin() * sweep_r).clamp(map.min_y + 12.0, map.max_y - 12.0),
-                ]);
-            }
-        }
-        for [x, y] in sweep_pts {
-            {
+                let x = (nc[0] + ang.cos() * sweep_r).clamp(map.min_x + 12.0, map.max_x - 12.0);
+                let y = (nc[1] + ang.sin() * sweep_r).clamp(map.min_y + 12.0, map.max_y - 12.0);
                 if !zone_in_stadium && in_stadium_zone(x, y) { continue; }
                 if dist2d([x, y], obs.zone.center) > obs.zone.radius - 10.0 { continue; }
                 let tz = map.terrain_z(x, y);
@@ -2075,9 +1869,7 @@ fn pick_macro_hold_spot(
                 if d_me < 25.0 { continue; }
                 let stale = (obs.t - state.sector_visited_t(x, y)).min(120.0);
                 let cov = map.cover_at([x, y]) as f64;
-                let open_vis = (1.0 - (cov - 0.35).abs() * 2.0).max(0.0);
-                let d_nc_pen = (dist2d([x, y], nc) - nr * 0.82).max(0.0) * 0.65;
-                let mut sc = stale * 2.4 + open_vis * 34.0 - (d_me - 80.0).abs() * 0.45 - d_nc_pen;
+                let mut sc = stale * 2.2 + cov * 26.0 - (d_me - 95.0).abs() * 0.45;
                 if state.is_ffa() || !state.is_practice() {
                     for s in &state.sounds {
                         if obs.t - s.t < 2.2 && dist2d([x, y], s.est_pos) < 85.0 {

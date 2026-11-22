@@ -362,7 +362,7 @@ impl ArenaMap {
                     let z = row[fz];
                     let height = row[fh];
                     let crown_r = ix_cr.map(|k| row[k]).unwrap_or(3.0);
-                    let crown_base = ix_cb.map(|k| z + row[k]).unwrap_or(z + height * 0.4);
+                    let crown_base = ix_cb.map(|k| row[k]).unwrap_or(z + height * 0.4);
                     let trunk_r = ix_tr.map(|k| row[k]).unwrap_or(0.5);
                     let crown_x = ix_cx.map(|k| row[k]).unwrap_or(x);
                     let crown_y = ix_cy.map(|k| row[k]).unwrap_or(y);
