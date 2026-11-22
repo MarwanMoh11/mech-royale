@@ -1361,7 +1361,7 @@ fn pick_tactical_position(
     let primary_enemy = primary_id.and_then(|pid| enemies.iter().find(|e| e.id == pid));
 
     let preferred_dist = if have_laser {
-        118.0
+        155.0
     } else {
         76.0
     };
@@ -1536,7 +1536,7 @@ fn pick_tactical_position(
 
     let mut active_enemies: Vec<&EnemySummary> = enemies
         .iter()
-        .filter(|e| e.dist <= 165.0 || (e.has_los && e.dist <= 275.0) || Some(e.id) == primary_id)
+        .filter(|e| e.dist <= 200.0 || (e.has_los && e.dist <= 275.0) || Some(e.id) == primary_id)
         .collect();
     active_enemies.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal));
     if active_enemies.len() > 5 {
@@ -1734,25 +1734,17 @@ fn pick_macro_hold_spot(
     let nr = obs.zone.next_radius;
     let zone_in_stadium = in_stadium_zone(nc[0], nc[1]);
 
-    // Phase A (still looting Laser / early cubes): sweep UNVISITED ground sectors (outer 280m + local 105m when unarmed!)
+    // Phase A (still looting Laser / early cubes): sweep UNVISITED ground sectors inside next_zone (avoids sounds in FFA/Unknown!)
     if !ready_for_rooftops {
         let mut best_sw: Option<(f64, [f64; 3])> = None;
-        let max_r = (nr * 0.82).clamp(30.0, 280.0);
-        let need_laser_sweep = find_weapon_slot(me, "laser").is_none();
-        for ring in 0..3 {
-            let use_local = ring == 2 && need_laser_sweep;
-            let sweep_r = if use_local {
-                105.0
-            } else if ring == 0 {
-                (max_r * 0.42).max(24.0)
-            } else {
-                (max_r * 0.85).max(40.0)
-            };
-            let origin = if use_local { [me.pos[0], me.pos[1]] } else { nc };
+        let max_r = (nr * 0.72).clamp(30.0, 210.0);
+        for ring in 0..2 {
+            let r_f = if ring == 0 { 0.45 } else { 0.85 };
+            let sweep_r = (max_r * r_f).max(24.0);
             for step in 0..8 {
                 let ang = (step as f64 / 8.0) * std::f64::consts::TAU + (ring as f64) * 0.39;
-                let x = (origin[0] + ang.cos() * sweep_r).clamp(map.min_x + 12.0, map.max_x - 12.0);
-                let y = (origin[1] + ang.sin() * sweep_r).clamp(map.min_y + 12.0, map.max_y - 12.0);
+                let x = (nc[0] + ang.cos() * sweep_r).clamp(map.min_x + 12.0, map.max_x - 12.0);
+                let y = (nc[1] + ang.sin() * sweep_r).clamp(map.min_y + 12.0, map.max_y - 12.0);
                 if !zone_in_stadium && in_stadium_zone(x, y) { continue; }
                 if dist2d([x, y], obs.zone.center) > obs.zone.radius - 10.0 { continue; }
                 let tz = map.terrain_z(x, y);
