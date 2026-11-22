@@ -208,7 +208,6 @@ pub struct WorldState {
     pub last_damaged_rear: bool,
     pub last_damaged_amount: f64,
     pub last_damaged_was_mortar: bool,
-    pub wounded_enemies_mask: u32,
     pub laser_shorted_until: f64,
     pub last_enemy_los_t: f64,
     pub my_laser_charge_start_t: Option<f64>,
@@ -279,7 +278,6 @@ impl WorldState {
             last_damaged_rear: false,
             last_damaged_amount: 0.0,
             last_damaged_was_mortar: false,
-            wounded_enemies_mask: 0,
             laser_shorted_until: -10.0,
             last_enemy_los_t: -100.0,
             my_laser_charge_start_t: None,
@@ -392,12 +390,6 @@ impl WorldState {
                                 if let Some(tr) = self.enemies.get_mut(&by) {
                                     tr.dmg_dealt_to_us += ev.amount.unwrap_or(0.0);
                                     tr.last_hit_us_t = t;
-                                    if ev.weapon.as_deref() == Some("gun") {
-                                        if t - tr.last_gun_shot_t > 2.1 { tr.gun_burst_shots = 0; }
-                                        tr.gun_reload_until = -10.0;
-                                        tr.gun_burst_shots = tr.gun_burst_shots.saturating_add(1);
-                                        tr.last_gun_shot_t = t;
-                                    }
                                 } else {
                                     unseen_dmg_mech = Some((by, b));
                                 }
@@ -414,9 +406,6 @@ impl WorldState {
                             if let Some(tr) = self.enemies.get_mut(&tid) {
                                 tr.last_damaged_by_us_t = t;
                                 tr.damaged_by_us += amt;
-                                if (0..32).contains(&tid) && tr.damaged_by_us >= 200.0 {
-                                    self.wounded_enemies_mask |= 1u32 << (tid as u32);
-                                }
                             }
                         }
                     }
@@ -432,7 +421,6 @@ impl WorldState {
                         self.our_kills += 1;
                     }
                     if let Some(tid) = ev.target {
-                        if (0..32).contains(&tid) { self.wounded_enemies_mask &= !(1u32 << (tid as u32)); }
                         if let Some(dead) = self.enemies.remove(&tid) {
                             let hl = dead.has_weapon("laser");
                             let keep = self.last_kill_drop_pos.map(|(_, kt, ol)| ol && !hl && t - kt < 45.0).unwrap_or(false);
@@ -493,7 +481,7 @@ impl WorldState {
             let near_any_npc = self
                 .npcs
                 .values()
-                .any(|n| dist2d([a.pos[0], a.pos[1]], [n.pos[0], n.pos[1]]) < 105.0);
+                .any(|n| dist2d([a.pos[0], a.pos[1]], [n.pos[0], n.pos[1]]) < 95.0);
 
             let sc = 1.0 + spc * (cubes.max(0) as f64);
             let eh = base_h * sc;
@@ -501,8 +489,8 @@ impl WorldState {
             let d_to_us = dist3d(e_eye, obs.me.center_pos());
             let yaw_e_to_us = (obs.me.pos[1] - a.pos[1]).atan2(obs.me.pos[0] - a.pos[0]);
             // Lightweight enemy-sees-us check (solid LOS only; skip double tree raycast every tick for <2ms budget!)
-            let enemy_sees_us = d_to_us < (self.config.vision.range + 10.0)
-                && (d_to_us < (self.config.vision.near_range + 3.0) || angle_diff(a.aim[0], yaw_e_to_us).abs() < 1.08)
+            let enemy_sees_us = d_to_us < 142.0
+                && (d_to_us < 38.0 || angle_diff(a.aim[0], yaw_e_to_us).abs() < 1.08)
                 && map.has_shot_los(e_eye, obs.me.center_pos());
             if enemy_sees_us {
                 self.squad_last_saw_us_t = t;
@@ -532,19 +520,20 @@ impl WorldState {
                     tr.accel = [0.0; 3];
                 }
                 let hp_drop = tr.hp - hp;
-                let in_z_strict = dist2d([a.pos[0], a.pos[1]], obs.zone.center) < obs.zone.radius - 14.0;
+                let in_z = dist2d([a.pos[0], a.pos[1]], obs.zone.center) < obs.zone.radius - 8.0;
+                // Require consecutive obs tick (no skipped hit events!) + tight gap <= 0.25s
                 let no_skipped_obs = self.prev_tick >= 0 && (obs.tick - self.prev_tick) <= 2;
                 if no_skipped_obs
                     && gap <= 0.25
                     && hp_drop > us_dmg + 40.0
-                    && in_z_strict
+                    && in_z
                     && !near_any_npc
                     && !tr.source_is_beam
                     && !tr.source_is_guess
                 {
                     tr.external_dmg_t = t;
-                    let self_mortar_possible = tr.has_weapon("mortar") || a.has_weapon("mortar");
-                    if hp_drop > us_dmg + 175.0 || !self_mortar_possible {
+                    // > 175 HP burst inside zone not from us and not from a 25-dmg NPC = confirmed mech-vs-mech FFA!
+                    if hp_drop > us_dmg + 175.0 {
                         self.ffa_confirmed = true;
                         self.true_ffa_confirmed = true;
                     }
@@ -558,7 +547,7 @@ impl WorldState {
                 tr.cubes = cubes;
                 tr.weapons = a.weapons.clone();
                 if a.charging {
-                    if !tr.charging { tr.charge_start_t = Some((t - 0.08).max(0.0)); }
+                    if !tr.charging { tr.charge_start_t = Some(t); }
                 } else {
                     if tr.charging && gap <= 0.25 && tr.charge_elapsed(t) >= 0.14 {
                         let e_lcd = self.config.weapon_f("laser", "cooldown", 1.65);
@@ -593,7 +582,7 @@ impl WorldState {
                     cubes,
                     weapons: a.weapons.clone(),
                     charging: a.charging,
-                    charge_start_t: if a.charging { Some((t - 0.22).max(0.0)) } else { None },
+                    charge_start_t: if a.charging { Some(t) } else { None },
                     last_seen_t: t,
                     visible_now: true,
                     damaged_by_us: us_dmg,
@@ -643,7 +632,7 @@ impl WorldState {
                         let d_tr = dist2d([tr.pos[0], tr.pos[1]], [obs.me.pos[0], obs.me.pos[1]]);
                         if d_tr < 68.0 {
                             let err = angle_diff((tr.pos[1] - obs.me.pos[1]).atan2(tr.pos[0] - obs.me.pos[0]), s.bearing).abs();
-                            if err < 0.38 && best.map(|(_, be)| err < be).unwrap_or(true) { best = Some((tr.id, err)); }
+                            if err < 0.26 && best.map(|(_, be)| err < be).unwrap_or(true) { best = Some((tr.id, err)); }
                         }
                     }
                 }
@@ -656,10 +645,10 @@ impl WorldState {
             } else if s.kind == "laser_charge" {
                 let start_t = (t - s.age).max(0.0);
                 for tr in self.enemies.values_mut() {
-                    if t - tr.last_seen_t < 8.0 && tr.has_weapon("laser") && !tr.charging {
+                    if t - tr.last_seen_t < 4.5 && tr.has_weapon("laser") && !tr.visible_now {
                         let d_tr = dist2d([tr.pos[0], tr.pos[1]], [obs.me.pos[0], obs.me.pos[1]]);
                         let err = angle_diff((tr.pos[1] - obs.me.pos[1]).atan2(tr.pos[0] - obs.me.pos[0]), s.bearing).abs();
-                        if d_tr < 148.0 && err < 0.30 { tr.heard_charge_t = tr.heard_charge_t.max(start_t); }
+                        if d_tr < 148.0 && err < 0.24 { tr.heard_charge_t = tr.heard_charge_t.max(start_t); }
                     }
                 }
             } else if s.kind == "laser" {
@@ -702,33 +691,6 @@ impl WorldState {
                 continue;
             }
             let fired_t = (t - b.age).max(0.0);
-            if !self.true_ffa_confirmed && b.age <= 0.25 {
-                let p0 = b.path[0]; let p1 = b.path[1];
-                let bdx = p1[0] - p0[0]; let bdy = p1[1] - p0[1]; let bdz = p1[2] - p0[2];
-                let blen = (bdx * bdx + bdy * bdy + bdz * bdz).sqrt();
-                if blen > 2.0 {
-                    let bu = [bdx / blen, bdy / blen, bdz / blen];
-                    let my_c = obs.me.center_pos();
-                    let to_me_yaw = (my_c[1] - p0[1]).atan2(my_c[0] - p0[0]);
-                    let beam_yaw = bdy.atan2(bdx);
-                    let proj_me = ((my_c[0] - p0[0]) * bu[0] + (my_c[1] - p0[1]) * bu[1] + (my_c[2] - p0[2]) * bu[2]).clamp(0.0, blen);
-                    let closest_me = [p0[0] + bu[0] * proj_me, p0[1] + bu[1] * proj_me, p0[2] + bu[2] * proj_me];
-                    let away_from_us = angle_diff(beam_yaw, to_me_yaw).abs() > 0.25 && dist3d(my_c, closest_me) > 12.0;
-                    let near_crate_or_npc = obs.crates.iter().any(|c| dist2d([c.pos[0], c.pos[1]], [p1[0], p1[1]]) < 6.0)
-                        || self.npcs.values().any(|n| dist2d([n.pos[0], n.pos[1]], [p1[0], p1[1]]) < 6.0);
-                    if away_from_us && !near_crate_or_npc {
-                        let stopped_midair = b.kind == "lightning" || map.has_shot_los(p0, [p1[0] + bu[0] * 4.0, p1[1] + bu[1] * 4.0, p1[2] + bu[2] * 4.0]);
-                        if stopped_midair && self.enemies.values().any(|other| {
-                            other.visible_now && other.id != b.by && other.id != obs.me.id
-                                && dist2d([other.pos[0], other.pos[1]], [p1[0], p1[1]]) <= other.radius(base_r, spc) + 1.4
-                                && p1[2] >= other.pos[2] - 0.8 && p1[2] <= other.pos[2] + other.height(base_h, spc) + 1.2
-                        }) {
-                            self.ffa_confirmed = true;
-                            self.true_ffa_confirmed = true;
-                        }
-                    }
-                }
-            }
             if b.kind == "laser" {
                 if let Some(tr) = self.enemies.get_mut(&b.by) {
                     tr.laser_ready_t = tr.laser_ready_t.max(fired_t + enemy_laser_cd);
@@ -824,8 +786,8 @@ impl WorldState {
             if p.kind != "gun" || self.seen_proj_ids.contains(&p.id) { continue; }
             self.seen_proj_ids[self.seen_proj_idx] = p.id;
             self.seen_proj_idx = (self.seen_proj_idx + 1) % self.seen_proj_ids.len();
-            let pspd_xy = p.vel[0].hypot(p.vel[1]).max(1.0);
-            let (vx, vy) = (p.vel[0] / pspd_xy, p.vel[1] / pspd_xy);
+            let pspd = (p.vel[0]*p.vel[0] + p.vel[1]*p.vel[1] + p.vel[2]*p.vel[2]).sqrt().max(1.0);
+            let (vx, vy) = (p.vel[0] / pspd, p.vel[1] / pspd);
             let mut best_shooter: Option<(i64, f64)> = None;
             for tr in self.enemies.values() {
                 if !tr.visible_now || !tr.has_weapon("gun") { continue; }
@@ -919,12 +881,12 @@ impl WorldState {
         }
         if (non_self_deaths >= 2 && t < 115.0)
             || (non_self_deaths >= 3 && t < 155.0)
-            || (non_self_deaths >= 1 && t < 75.0 && obs.zone.radius > 300.0 && self.wounded_enemies_mask == 0)
+            || (non_self_deaths >= 1 && t < 75.0 && obs.zone.radius > 300.0)
         {
             self.true_ffa_confirmed = true;
         }
         if self.true_ffa_confirmed
-            || (non_self_deaths >= 1 && obs.zone.radius > 165.0 && t < 110.0 && self.wounded_enemies_mask == 0)
+            || (non_self_deaths >= 1 && obs.zone.radius > 165.0 && t < 110.0)
             || (non_self_deaths >= 2 && t < 165.0)
         {
             self.ffa_confirmed = true;
@@ -971,7 +933,7 @@ impl WorldState {
             let d = dist2d([obs.me.pos[0], obs.me.pos[1]], [p[0], p[1]]);
             let pt = [p[0], p[1], p[2] + z_off];
             if d < 36.0 {
-                return map.has_shot_los(my_eye, pt) && !map.trees_block_vision(my_eye, pt);
+                return map.has_shot_los(my_eye, pt);
             }
             if d < 120.0 {
                 let ang = angle_diff((p[1] - obs.me.pos[1]).atan2(p[0] - obs.me.pos[0]), obs.me.aim[0]).abs();
@@ -995,9 +957,7 @@ impl WorldState {
         self.pickups.retain(|id, p| {
             if vis_pickup_ids.contains(id) { return true; }
             if t - p.last_seen_t > 240.0 { return false; }
-            if p.kind == "laser" && (p.pos[2] - obs.me.pos[2]).abs() > 3.5 && dist2d([obs.me.pos[0], obs.me.pos[1]], [p.pos[0], p.pos[1]]) > 12.0 {
-                return true;
-            }
+            if p.kind == "laser" && (p.pos[2] - obs.me.pos[2]).abs() > 3.5 && dist2d([obs.me.pos[0], obs.me.pos[1]], [p.pos[0], p.pos[1]]) > 12.0 { return true; }
             !do_evict || !should_be_visible(p.pos, 0.25)
         });
 
