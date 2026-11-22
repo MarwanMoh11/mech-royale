@@ -218,6 +218,8 @@ pub struct WorldState {
     pub practice_evidence: f64,
     pub mode: MatchMode,
     pub last_kill_drop_pos: Option<([f64; 3], f64, bool)>,
+    pub last_kill_t: f64,
+    pub last_kill_pos: [f64; 2],
     pub visited_sectors: [f64; 192],
     // Movement / stuck tracking
     pub prev_pos: [f64; 3],
@@ -287,6 +289,8 @@ impl WorldState {
             practice_evidence: 0.0,
             mode: MatchMode::Unknown,
             last_kill_drop_pos: None,
+            last_kill_t: -100.0,
+            last_kill_pos: [0.0, 0.0],
             visited_sectors: [-1000.0; 192],
             prev_pos: [0.0; 3],
             prev_t: -1.0,
@@ -419,6 +423,8 @@ impl WorldState {
                 "kill" => {
                     if ev.target.map(|tid| (0..100).contains(&tid)).unwrap_or(true) {
                         self.our_kills += 1;
+                        self.last_kill_t = t;
+                        self.last_kill_pos = [obs.me.pos[0], obs.me.pos[1]];
                     }
                     if let Some(tid) = ev.target {
                         if let Some(dead) = self.enemies.remove(&tid) {

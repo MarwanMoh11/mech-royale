@@ -1808,6 +1808,26 @@ fn pick_tactical_position(
                 sc -= ((exposed - 1) as f64) * 275.0;
             }
             sc -= (charging_los as f64) * 85.0;
+            // Brawl Stars / Fortnite Storm-Edge Back-Wall: hug safe outer rim of next_zone with enemies inward!
+            if obs.zone.next_radius >= 50.0 {
+                let d_nc = dist2d([cand[0], cand[1]], obs.zone.next_center);
+                let rim_lo = obs.zone.next_radius * 0.62;
+                let rim_hi = (obs.zone.next_radius - 10.0).max(rim_lo + 4.0);
+                if d_nc >= rim_lo && d_nc <= rim_hi {
+                    if let Some(pe) = primary_enemy {
+                        let inx = obs.zone.next_center[0] - cand[0];
+                        let iny = obs.zone.next_center[1] - cand[1];
+                        let inl = inx.hypot(iny).max(1e-6);
+                        let ex = pe.pos[0] - cand[0];
+                        let ey = pe.pos[1] - cand[1];
+                        let el = ex.hypot(ey).max(1e-6);
+                        let inward_dot = (inx / inl) * (ex / el) + (iny / inl) * (ey / el);
+                        if inward_dot > 0.25 {
+                            sc += 38.0 * inward_dot;
+                        }
+                    }
+                }
+            }
             if active_enemies.len() >= 2 {
                 let e0 = active_enemies[0]; let e1 = active_enemies[1];
                 let (dx0, dy0) = (e0.pos[0] - cand[0], e0.pos[1] - cand[1]);
@@ -1901,7 +1921,9 @@ fn pick_macro_hold_spot(
     if !ready_for_rooftops {
         let have_laser = find_weapon_slot(me, "laser").is_some();
         // Active Phase 0-1 Perimeter Hunt in Practice: break the Phase 2-3 deathball by hunting drop holders & isolated sounds!
+        let post_kill_vacate = (obs.t - state.last_kill_t) < 5.5 && dist2d([me.pos[0], me.pos[1]], state.last_kill_pos) < 42.0 && me.hp < me.max_hp * 0.92;
         let active_hunt = !state.is_ffa()
+            && !post_kill_vacate
             && have_laser
             && !state.healing_mode
             && me.hp >= me.max_hp * 0.72
@@ -1972,6 +1994,10 @@ fn pick_macro_hold_spot(
                 let esc = map.escape_deg_at([x, y]);
                 let mut sc = cov * (if esc >= 3 { 115.0 } else if esc == 2 { 85.0 } else { 20.0 }) - d_me * 0.35;
                 if esc <= 1 { sc -= 120.0; } // Never camp inside a 3-walled dead-end alcove!
+                // Post-Kill Rotation Reset (Fortnite/Apex 1vSquad): vacate the 380m laser sound site right after a kill!
+                if (obs.t - state.last_kill_t) < 7.5 && dist2d([x, y], state.last_kill_pos) < 48.0 {
+                    sc -= 75.0;
+                }
                 if d_me < 8.0 && cov >= 0.25 && esc >= 2 {
                     sc += 24.0;
                 }
@@ -1997,8 +2023,8 @@ fn pick_macro_hold_spot(
                 }
             }
             for ring in 0..2 {
-                let r_f = if ring == 0 { 0.38 } else { 0.78 };
-                let hr = (hold_max_r * r_f).max(16.0);
+                let r_f = if ring == 0 { 0.72 } else { 0.90 };
+                let hr = ((nr - 12.0).max(18.0) * r_f).min(hold_max_r.max(nr * 0.85)).max(16.0);
                 for step in 0..8 {
                     let ang = (step as f64 / 8.0) * std::f64::consts::TAU + (ring as f64) * 0.39;
                     let x = (nc[0] + ang.cos() * hr).clamp(map.min_x + 12.0, map.max_x - 12.0);
