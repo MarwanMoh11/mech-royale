@@ -367,9 +367,19 @@ impl WorldState {
                         if let Some(by) = ev.by {
                             self.last_damaged_by = Some(by);
                             if (0..100).contains(&by) {
+                                let is_laser_hit = ev.weapon.as_deref() == Some("laser");
+                                let enemy_laser_cd = self.config.weapon_f("laser", "cooldown", 1.65);
                                 if let Some(tr) = self.enemies.get_mut(&by) {
                                     tr.dmg_dealt_to_us += ev.amount.unwrap_or(0.0);
                                     tr.last_hit_us_t = t;
+                                    if is_laser_hit {
+                                        tr.laser_ready_t = tr.laser_ready_t.max(t + enemy_laser_cd);
+                                        tr.charging = false;
+                                        tr.charge_start_t = None;
+                                        if !tr.has_weapon("laser") {
+                                            tr.weapons.push("laser".to_string());
+                                        }
+                                    }
                                 } else {
                                     unseen_dmg_mech = Some((by, b));
                                 }
@@ -920,15 +930,10 @@ impl WorldState {
             self.laser_peek = LaserPeekState::Idle;
         }
 
-        // Opus #3: rapid 0.30-0.55s anti-lead micro-juke flips during active LOS gunfire (beats 0.47s gun bullet flight!)
+        // Strafe rhythm flip
         if t >= self.next_strafe_flip_t {
             self.strafe_sign = -self.strafe_sign;
-            let in_los = (t - self.last_enemy_los_t) < 0.6;
-            self.next_strafe_flip_t = if in_los {
-                t + 0.30 + self.next_rand() * 0.25
-            } else {
-                t + 1.15 + self.next_rand() * 1.05
-            };
+            self.next_strafe_flip_t = t + 1.15 + self.next_rand() * 1.05;
         }
 
         self.prev_pos = obs.me.pos;

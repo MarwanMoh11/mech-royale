@@ -928,7 +928,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
 
         let escaping_lightning = enemy_lightning_within_52 && !have_light;
-        if (enemies_with_los >= 2 || reload_retreat || gun_only_outnumbered || laser_cd_cover || (need_heal && enemies_with_los >= 1) || escaping_lightning)
+        if (enemies_with_los >= 2 || reload_retreat || gun_only_outnumbered || laser_cd_cover || (punish_peek && !combat.target_has_los) || (need_heal && enemies_with_los >= 1) || escaping_lightning)
             && me.energy > 16.0
         {
             want_boost = true;
@@ -1056,11 +1056,48 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
 
     let stuck_overhang = map.is_covered_above(me.pos[0], me.pos[1], me.pos[2] + me.height() - 0.5, 4.0);
     let on_elevated_non_roof = me.pos[2] > map.terrain_z(me.pos[0], me.pos[1]) + 4.0 && cur_roof.is_none();
-    let stuck_air_ok = t < state.stuck_escape_until
-        && !stuck_overhang
-        && (state.stuck_streak < 4 || on_elevated_non_roof)
-        && (enemies_with_los == 0 || !me.in_zone || on_elevated_non_roof);
-    if t < state.stuck_escape_until {
+    let stadium_rim_hop = zone_urgent
+        && !in_stadium_zone(obs.zone.next_center[0], obs.zone.next_center[1])
+        && me.pos[0] > -310.0
+        && me.pos[0] < -220.0
+        && me.pos[1] > -12.5
+        && me.pos[1] <= 5.5
+        && me.pos[2] >= 13.0;
+    let zone_stuck_jet = !me.in_zone && state.stuck_streak >= 3 && !stuck_overhang;
+    let stuck_air_ok = stadium_rim_hop
+        || zone_stuck_jet
+        || (t < state.stuck_escape_until
+            && !stuck_overhang
+            && (state.stuck_streak < 4 || on_elevated_non_roof)
+            && (enemies_with_los == 0 || !me.in_zone || on_elevated_non_roof));
+    if stadium_rim_hop {
+        let tx = (-255.0 - me.pos[0]).clamp(-6.0, 6.0) * 0.08;
+        let vlen = tx.hypot(1.0);
+        move_vec = [tx / vlen, -1.0 / vlen];
+        if me.pos[2] < 24.5 && me.energy > 8.0 {
+            if me.grounded {
+                want_jump = true;
+                want_boost = false;
+            } else {
+                want_boost = true;
+            }
+        }
+    } else if zone_stuck_jet && t < state.stuck_escape_until {
+        let zx = obs.zone.next_center[0] - me.pos[0];
+        let zy = obs.zone.next_center[1] - me.pos[1];
+        let zd = zx.hypot(zy).max(1e-6);
+        move_vec = [zx / zd, zy / zd];
+        if me.grounded {
+            if me.energy >= 52.0 {
+                want_jump = true;
+                want_boost = false;
+            } else {
+                want_boost = false;
+            }
+        } else {
+            want_boost = me.energy > 6.0;
+        }
+    } else if t < state.stuck_escape_until {
         move_vec = state.stuck_escape_dir;
         if stuck_air_ok && me.energy > 14.0 {
             if me.grounded {
@@ -1204,59 +1241,13 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
     }
 
-    if dodge.urgency >= 3.0 && me.in_zone && !zone_urgent && !in_air_hop {
+    if dodge.urgency >= (if is_ffa { 2.5 } else { 3.0 }) && me.in_zone && !zone_urgent && !in_air_hop {
         // Pure full-speed corner duck / mortar blast evasion — no diagonal drag from tactical goal!
         move_vec = dodge.vec;
     } else if dodge.urgency > 0.1 && !in_air_hop {
         let dw = dodge.urgency.clamp(0.5, 3.2);
         move_vec[0] += dodge.vec[0] * dw;
         move_vec[1] += dodge.vec[1] * dw;
-    } else if enemies_with_los >= 1
-        && !combat.charging_laser
-        && !zone_urgent
-        && !final_circle
-        && !in_air_hop
-        && state.climb_state.is_none()
-        && cur_roof.is_none()
-        && t >= state.stuck_escape_until
-    {
-        // Opus #3: anti-lead perpendicular micro-juke under gunfire (>45m), rejecting any step that increases exposure!
-        if let Some(pe) = visible_enemies
-            .iter()
-            .filter(|e| e.has_los && e.dist > 45.0)
-            .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal))
-        {
-            let to_e = (pe.pos[1] - me.pos[1]).atan2(pe.pos[0] - me.pos[0]);
-            let cur_exp = visible_enemies
-                .iter()
-                .filter(|e| map.has_shot_los(e.muzzle, my_upper))
-                .count();
-            for &sgn in &[state.strafe_sign, -state.strafe_sign] {
-                let ang = to_e + sgn * std::f64::consts::FRAC_PI_2;
-                let tx = me.pos[0] + ang.cos() * 4.5;
-                let ty = me.pos[1] + ang.sin() * 4.5;
-                let tz = map.terrain_z(tx, ty);
-                if dist2d([tx, ty], obs.zone.center) < obs.zone.radius - 4.0
-                    && map.terrain_slope_deg(tx, ty) < 44.0
-                    && !map.is_cylinder_blocked(tx, ty, tz, me.radius() + 0.3, me.height(), me.step_up())
-                {
-                    let step_up_pt = [tx, ty, tz + me.height() * 0.78];
-                    let new_exp = visible_enemies
-                        .iter()
-                        .filter(|e| map.has_shot_los(e.muzzle, step_up_pt))
-                        .count();
-                    if new_exp <= cur_exp {
-                        if move_vec[0].hypot(move_vec[1]) < 0.15 {
-                            move_vec = [ang.cos(), ang.sin()];
-                        } else {
-                            move_vec[0] += ang.cos() * 0.65;
-                            move_vec[1] += ang.sin() * 0.65;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
     }
 
     let mlen = move_vec[0].hypot(move_vec[1]);
@@ -1285,7 +1276,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         && state.climb_state.is_none()
         && state.roof_hop.is_none()
         && !stuck_air_ok
-        && dz_goal <= 0.3
+        && dz_goal <= (if is_ffa { 2.5 } else { 0.3 })
     {
         want_boost = false;
     }
@@ -1347,14 +1338,18 @@ fn find_safe_zone_target(obs: &Observation, map: &ArenaMap, margin_cur: f64) -> 
         }
     }
 
-    // Ohio Stadium horseshoe escape: when zone is outside the Stadium, exit via the open south mouth (-275, 12)
-    // or walk south around west wall p[235] via (-395, 48) — eliminates ALL Stadium zone deaths (m24/m25/m29)!
+    // Ohio Stadium rim-hop escape: walk up walkable 26-deg south bleachers to (-255, 0, z=18) then jet +5m over p[221] (top=23.4) to (-255, -24)!
     if !in_stadium_zone(nc[0], nc[1]) {
-        // Inside the Stadium bowl / east bleacher rim
-        if me.pos[0] > -358.0 && me.pos[0] < -174.0 && me.pos[1] > 35.0 && me.pos[1] < 258.0 {
-            let ex = -275.0;
-            let ey = 12.0;
-            return [ex, ey, map.terrain_z(ex, ey)];
+        if me.pos[0] > -364.0 && me.pos[0] < -174.0 && me.pos[1] > -12.0 && me.pos[1] < 260.0 {
+            if me.pos[1] > 4.0 {
+                let ex = -255.0;
+                let ey = 0.0;
+                return [ex, ey, map.terrain_z(ex, ey)];
+            } else {
+                let ex = -255.0;
+                let ey = -24.0;
+                return [ex, ey, map.terrain_z(ex, ey)];
+            }
         }
         // Directly behind west Stadium wall p[235] (x=[-382.2,-352.2], y=[74.3,221.8]) trying to go east
         if me.pos[0] >= -430.0 && me.pos[0] <= -355.0 && me.pos[1] > 65.0 && me.pos[1] < 228.0 && nc[0] > -310.0 {

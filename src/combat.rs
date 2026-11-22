@@ -136,10 +136,31 @@ fn aim_hits_cylinder(actual_aim: [f64; 2], desired_aim: [f64; 2], dist: f64, tar
 
 /// Multi-height LOS check against an enemy mech (chest, upper torso, lower torso).
 pub fn best_los_point(map: &ArenaMap, from: [f64; 3], e_pos: [f64; 3], e_h: f64) -> Option<[f64; 3]> {
+    best_los_point_ex(map, from, e_pos, e_h, false)
+}
+
+/// Multi-height + optional FFA lateral corner-slice LOS check against an enemy mech.
+pub fn best_los_point_ex(map: &ArenaMap, from: [f64; 3], e_pos: [f64; 3], e_h: f64, lateral: bool) -> Option<[f64; 3]> {
     for frac in [0.50, 0.78, 0.26] {
         let pt = [e_pos[0], e_pos[1], e_pos[2] + e_h * frac];
         if map.has_shot_los(from, pt) {
             return Some(pt);
+        }
+    }
+    if lateral {
+        let dx = e_pos[0] - from[0];
+        let dy = e_pos[1] - from[1];
+        let len = dx.hypot(dy);
+        if len > 4.0 {
+            let px = -dy / len * 1.45;
+            let py = dx / len * 1.45;
+            let cz = e_pos[2] + e_h * 0.55;
+            for sgn in [1.0, -1.0] {
+                let pt = [e_pos[0] + px * sgn, e_pos[1] + py * sgn, cz];
+                if map.has_shot_los(from, pt) {
+                    return Some(pt);
+                }
+            }
         }
     }
     None
@@ -758,18 +779,23 @@ pub fn decide_combat(
         let ec = e.center(base_h, spc);
         let d = dist3d(my_muzzle, ec);
         if d < 70.0 { any_enemy_within_70 = true; }
-        if e.visible_now && e.has_weapon("lightning") && d < 50.0 {
+        if !state.is_ffa() && e.visible_now && e.has_weapon("lightning") && d < 50.0 {
             any_lightning_threat_close = true;
         }
         if d > 285.0 { continue; }
 
         let can_check_los = e.visible_now || (e.source_is_beam && age < 0.40);
         let los_pt = if can_check_los {
-            best_los_point(map, my_muzzle, e.pos, eh)
+            best_los_point_ex(map, my_muzzle, e.pos, eh, state.is_ffa())
         } else {
             None
         };
-        if los_pt.is_some() { any_enemy_has_los = true; }
+        if los_pt.is_some() {
+            any_enemy_has_los = true;
+            if state.is_ffa() && e.visible_now && e.has_weapon("lightning") && d < 48.0 {
+                any_lightning_threat_close = true;
+            }
+        }
 
         // FFA target filtering + third-party snipe (never drop target mid-charge!)
         let third_party_kill = e.hp <= est_instant_burst * 1.15
@@ -942,9 +968,29 @@ pub fn decide_combat(
             && (gun_ready || (have_light.is_some() && me.energy >= light_energy))
             && e.hp > 420.0;
         let ducking_enemy_laser = dodge.urgency >= 2.5 && dodge.mortar_blast_pos.is_none();
+        // Punish-window pre-charge: when target Laser just fired (cd >= 0.85s) and WE are stepping out of cover into LOS!
+        let my_spd = me.vel[0].hypot(me.vel[1]);
+        let punish_precharge = !has_los
+            && e.visible_now
+            && !e.source_is_beam
+            && !e.source_is_guess
+            && !any_enemy_has_los
+            && !state.healing_mode
+            && e.has_weapon("laser")
+            && (e.laser_ready_t - t) >= 0.85
+            && d >= 38.0
+            && d <= 175.0
+            && my_spd >= 3.0
+            && best_los_point_ex(
+                map,
+                [my_muzzle[0] + me.vel[0] * 0.35, my_muzzle[1] + me.vel[1] * 0.35, my_muzzle[2]],
+                [e.pos[0] + e.vel[0] * 0.35, e.pos[1] + e.vel[1] * 0.35, e.pos[2]],
+                eh,
+                state.is_ffa(),
+            ).is_some();
         let laser_can_start = laser_slot.is_some()
             && allow_shoot
-            && has_los
+            && (has_los || punish_precharge)
             && laser_cd <= dt_sim + 1e-4
             && !state.is_laser_shorted(t)
             && d <= laser_range
@@ -1058,9 +1104,24 @@ pub fn decide_combat(
             }
         }
 
-        // B4) GUN (Validate strictly on the FIRST sim tick that will consume the held trigger! Fixes P0-2)
+        // B4) GUN (Validate strictly on FIRST sim tick + strictly FFA rear-Laser ambush hold for 472-660 dmg snipes!)
+        let yaw_e_to_us_gun = (me.pos[1] - e.pos[1]).atan2(me.pos[0] - e.pos[0]);
+        let laser_ambush_feasible = state.is_ffa()
+            && (laser_charge > 0.0
+                || (have_laser.is_some()
+                    && laser_cd <= 0.55
+                    && !state.is_laser_shorted(t)
+                    && d <= laser_range
+                    && !any_lightning_threat_close
+                    && !close_range_speed_trap
+                    && !ducking_enemy_laser));
+        let hold_gun_for_rear_laser = laser_ambush_feasible
+            && !e.charging
+            && e.last_hit_us_t < t - 4.0
+            && e.hp > 180.0
+            && angle_diff(e.aim[0], yaw_e_to_us_gun).abs() > half_front_arc + 0.05;
         if let Some(gs) = gun_slot {
-            if allow_shoot && has_los && d <= gun_range && !mortar_owns_aim {
+            if allow_shoot && has_los && d <= gun_range && !mortar_owns_aim && !hold_gun_for_rear_laser {
                 if gun_fires_t1 && barrel_clear_t1 {
                     let hit1 = aim_hits_cylinder(aim_t1, desired_gun_aim, d, (er + 0.3) * 1.05, eh * 0.96);
                     let hit_dir = d < 32.0 && aim_hits_cylinder(aim_t1, hitscan_aim, d, (er + 0.3) * 1.05, eh * 0.96);
@@ -1108,6 +1169,7 @@ pub fn decide_combat(
         .map(|e| target_has_los && dist3d(my_muzzle, e.center(base_h, spc)) < 80.0)
         .unwrap_or(false);
     let in_enemy_fight = laser_charge > 0.0
+        || (state.is_ffa() && (fire[0] || fire[1]))
         || (target_enemy_id.is_some() && (close_active_mech || (!npc_aggro_active && (target_has_los || fire[0] || fire[1]))))
         || (under_unseen_fire && !npc_hit_us_recently)
         || (any_enemy_within_70 && !npc_aggro_active);
@@ -1193,7 +1255,11 @@ pub fn decide_combat(
                 cmd_aim = Some([syaw, -0.02]);
             } else {
                 let max_sound_d = if have_laser.is_some() { 120.0 } else { 55.0 };
-                if let Some(s) = state.sounds.iter().rev().find(|s| t - s.t < 1.5 && s.dist_est < max_sound_d) {
+                if let Some(s) = state.sounds.iter().rev().find(|s| {
+                    t - s.t < 1.5
+                        && s.dist_est < max_sound_d
+                        && (!state.is_ffa() || (s.kind != "crate" && s.kind != "npc_gun"))
+                }) {
                     cmd_aim = Some([s.bearing, 0.0]);
                 }
             }
