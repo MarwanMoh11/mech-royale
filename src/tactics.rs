@@ -94,18 +94,17 @@ pub fn pick_upgrade(offer: &Offer, obs: &Observation, state: &WorldState) -> usi
         let s = match ch.id.as_str() {
             "nanites" => {
                 let base = if is_ffa {
-                    if stacks == 0 { 130.0 } else { 118.0 }
+                    if stacks == 0 { 132.0 } else { 124.0 }
                 } else {
-                    if stacks == 0 { 135.0 } else { 120.0 }
+                    if stacks == 0 { 138.0 } else { 132.0 }
                 };
-                if hp_frac < 0.72 { base + 7.0 } else { base }
+                if hp_frac < 0.75 { base + 6.0 } else { base }
             }
-            // Zone damage ignores armor -> Plating is #1 in FFA final circle HP race! (Opus #5 + Fable #5)
-            "plating" => if is_ffa { 136.0 } else { 125.0 },
-            // Flat armor score (fixes stack-bonus bug where 2nd/3rd armor beat plating/nanites!)
-            "armor" => if is_ffa { 114.0 } else { 122.0 },
-            "laser_damage" => if have_laser { if is_ffa { 122.0 } else { 128.0 } } else { 32.0 },
-            "laser_charge" => if have_laser { if is_ffa { 108.0 } else { 114.0 } } else { 32.0 },
+            // Zone damage ignores armor -> Plating (+15% max HP + heal) beats Armor (-8% dmg = +8.7% EHP)!
+            "plating" => if is_ffa { 138.0 } else { 128.0 },
+            "armor" => if is_ffa { 114.0 } else { 116.0 },
+            "laser_damage" => if have_laser { if is_ffa { 124.0 } else { 130.0 } } else { 32.0 },
+            "laser_charge" => if have_laser { if is_ffa { 118.0 } else { 125.0 } } else { 32.0 },
             "lightning_range" => if have_light { if is_ffa { 106.0 } else { 110.0 } } else { 28.0 },
             "servos" => if is_ffa { 109.0 } else { 104.0 },
             "lightning_efficiency" => if have_light { if is_ffa { 98.0 } else { 102.0 } } else { 25.0 },
@@ -1361,7 +1360,7 @@ fn pick_tactical_position(
     let primary_enemy = primary_id.and_then(|pid| enemies.iter().find(|e| e.id == pid));
 
     let preferred_dist = if have_laser {
-        155.0
+        118.0
     } else {
         76.0
     };
@@ -1536,7 +1535,7 @@ fn pick_tactical_position(
 
     let mut active_enemies: Vec<&EnemySummary> = enemies
         .iter()
-        .filter(|e| e.dist <= 200.0 || (e.has_los && e.dist <= 275.0) || Some(e.id) == primary_id)
+        .filter(|e| e.dist <= 165.0 || (e.has_los && e.dist <= 275.0) || Some(e.id) == primary_id)
         .collect();
     active_enemies.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal));
     if active_enemies.len() > 5 {
