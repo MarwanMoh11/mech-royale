@@ -1177,7 +1177,10 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
     }
 
-    if dodge.urgency > 0.1 && !in_air_hop {
+    if dodge.urgency >= 3.0 && me.in_zone && !zone_urgent && !in_air_hop {
+        // Pure full-speed corner duck / mortar blast evasion — no diagonal drag from tactical goal!
+        move_vec = dodge.vec;
+    } else if dodge.urgency > 0.1 && !in_air_hop {
         let dw = dodge.urgency.clamp(0.5, 3.2);
         move_vec[0] += dodge.vec[0] * dw;
         move_vec[1] += dodge.vec[1] * dw;
