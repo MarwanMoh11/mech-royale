@@ -362,7 +362,7 @@ impl ArenaMap {
                     let z = row[fz];
                     let height = row[fh];
                     let crown_r = ix_cr.map(|k| row[k]).unwrap_or(3.0);
-                    let crown_base = ix_cb.map(|k| row[k]).unwrap_or(z + height * 0.4);
+                    let crown_base = z + ix_cb.map(|k| row[k]).unwrap_or(height * 0.4);
                     let trunk_r = ix_tr.map(|k| row[k]).unwrap_or(0.5);
                     let crown_x = ix_cx.map(|k| row[k]).unwrap_or(x);
                     let crown_y = ix_cy.map(|k| row[k]).unwrap_or(y);
@@ -1288,7 +1288,7 @@ impl ArenaMap {
         let gy1 = (((max_y - self.grid_min_y) / GRID_CELL).floor().max(0.0) as usize).min(self.grid_ny - 1);
 
         let mut canopy_len = 0.0;
-        let mut seen_trees = [0u64; 64]; // bitset for up to 4096 trees (zero double-counting!)
+        let mut seen_trees = [0u64; 128]; // bitset for up to 8192 trees (zero double-counting!)
         // Traverse only cells near line (skip far cells in AABB)
         let nx_perp = -dir[1];
         let ny_perp = dir[0];
@@ -1365,6 +1365,157 @@ impl ArenaMap {
         true
     }
 
+    /// True if a mech can walk directly from `a` to `b` without hitting walls, steep slopes, or cliffs.
+    pub fn is_ground_segment_clear(
+        &self,
+        a: [f64; 2],
+        b: [f64; 2],
+        start_z: f64,
+        mech_r: f64,
+        mech_h: f64,
+        step_up: f64,
+    ) -> bool {
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let d = dx.hypot(dy);
+        if d < 0.25 {
+            return true;
+        }
+        // Fast waist-height solid prism rejection (~1.5 us)
+        let end_z = self.terrain_z(b[0], b[1]);
+        let rdir = [dx / d, dy / d, (end_z - start_z) / d];
+        let rlen = (rdir[0] * rdir[0] + rdir[1] * rdir[1] + rdir[2] * rdir[2]).sqrt().max(1e-6);
+        let udir = [rdir[0] / rlen, rdir[1] / rlen, rdir[2] / rlen];
+        if let Some(hit) = self.raycast_solid([a[0], a[1], start_z + 2.6], udir, (d * rlen - 0.15).max(0.05)) {
+            if hit.prism_id.is_some() {
+                return false;
+            }
+        }
+        let steps = (d / 2.4).ceil().clamp(2.0, 24.0) as usize;
+        let mut prev_z = start_z;
+        for i in 1..=steps {
+            let f = i as f64 / steps as f64;
+            let sx = a[0] + dx * f;
+            let sy = a[1] + dy * f;
+            let sz = self.support_z(sx, sy, prev_z, step_up, mech_h);
+            if (sz - prev_z) > step_up + 0.45 || (prev_z - sz) > 3.5 {
+                return false;
+            }
+            if (sz - self.terrain_z(sx, sy)).abs() < 0.5 && self.terrain_slope_deg(sx, sy) > 46.5 {
+                return false;
+            }
+            if self.is_cylinder_blocked(sx, sy, sz, mech_r + 0.15, mech_h, step_up) {
+                return false;
+            }
+            prev_z = sz;
+        }
+        true
+    }
+
+    /// Flank-guarded cylinder exposure test: checks center (0.78*h) + left/right flanks (0.62*h, +/-0.80*r).
+    pub fn is_cylinder_exposed_to(&self, attacker_muz: [f64; 3], feet_pos: [f64; 3], mech_r: f64, mech_h: f64) -> bool {
+        if self.has_shot_los(attacker_muz, [feet_pos[0], feet_pos[1], feet_pos[2] + mech_h * 0.78]) {
+            return true;
+        }
+        let dx = feet_pos[0] - attacker_muz[0];
+        let dy = feet_pos[1] - attacker_muz[1];
+        let d = dx.hypot(dy);
+        if d > 1.0 {
+            let fl = (mech_r * 0.80).clamp(1.2, 3.2);
+            let px = (-dy / d) * fl;
+            let py = (dx / d) * fl;
+            let mz = feet_pos[2] + mech_h * 0.62;
+            if self.has_shot_los(attacker_muz, [feet_pos[0] + px, feet_pos[1] + py, mz]) {
+                return true;
+            }
+            if self.has_shot_los(attacker_muz, [feet_pos[0] - px, feet_pos[1] - py, mz]) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Extract exact (cover_pos, peek_pos) seams from building prism silhouette vertices near `me_pos`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn corner_peek_pairs(
+        &self,
+        me_pos: [f64; 3],
+        enemy_muzzle: [f64; 3],
+        enemy_center: [f64; 3],
+        mech_r: f64,
+        mech_h: f64,
+        mech_muz_h: f64,
+        step_up: f64,
+        zone_c: [f64; 2],
+        zone_r: f64,
+    ) -> Vec<([f64; 3], [f64; 3])> {
+        let mut out = Vec::with_capacity(8);
+        let search_r = 34.0;
+        for (pid, p) in self.prisms.iter().enumerate() {
+            if p.kind == PrismKind::Stadium || p.area < 28.0 {
+                continue;
+            }
+            if p.top < me_pos[2] + mech_h * 0.88 || p.base > me_pos[2] + 3.0 {
+                continue;
+            }
+            let dx_bb = (me_pos[0] - p.max_x).max(p.min_x - me_pos[0]).max(0.0);
+            let dy_bb = (me_pos[1] - p.max_y).max(p.min_y - me_pos[1]).max(0.0);
+            if dx_bb.hypot(dy_bb) > search_r {
+                continue;
+            }
+            for &v in &p.outer {
+                if (v[0] - me_pos[0]).hypot(v[1] - me_pos[1]) > 28.0 {
+                    continue;
+                }
+                let vx = v[0] - enemy_muzzle[0];
+                let vy = v[1] - enemy_muzzle[1];
+                let vlen = vx.hypot(vy);
+                if vlen < 16.0 {
+                    continue;
+                }
+                let ux = vx / vlen;
+                let uy = vy / vlen;
+                let perp = [-uy, ux];
+                let in_a = self.point_in_prism_2d(pid, v[0] + perp[0] * 1.5, v[1] + perp[1] * 1.5);
+                let in_b = self.point_in_prism_2d(pid, v[0] - perp[0] * 1.5, v[1] - perp[1] * 1.5);
+                if in_a == in_b {
+                    continue;
+                }
+                let out_s = if !in_a { 1.0 } else { -1.0 };
+                let ox = perp[0] * out_s;
+                let oy = perp[1] * out_s;
+                let cov_xy = [v[0] + ux * (mech_r + 2.3) - ox * 0.65, v[1] + uy * (mech_r + 2.3) - oy * 0.65];
+                let peek_xy = [v[0] + ux * 0.8 + ox * (mech_r + 1.85), v[1] + uy * 0.8 + oy * (mech_r + 1.85)];
+                if (cov_xy[0] - zone_c[0]).hypot(cov_xy[1] - zone_c[1]) > zone_r - 4.5
+                    || (peek_xy[0] - zone_c[0]).hypot(peek_xy[1] - zone_c[1]) > zone_r - 4.5
+                {
+                    continue;
+                }
+                let cov_z = self.support_z(cov_xy[0], cov_xy[1], me_pos[2], step_up, mech_h);
+                let peek_z = self.support_z(peek_xy[0], peek_xy[1], cov_z, step_up, mech_h);
+                if self.is_cylinder_blocked(cov_xy[0], cov_xy[1], cov_z, mech_r + 0.25, mech_h, step_up)
+                    || self.is_cylinder_blocked(peek_xy[0], peek_xy[1], peek_z, mech_r + 0.25, mech_h, step_up)
+                {
+                    continue;
+                }
+                if !self.is_ground_segment_clear(cov_xy, peek_xy, cov_z, mech_r, mech_h, step_up) {
+                    continue;
+                }
+                if self.is_cylinder_exposed_to(enemy_muzzle, [cov_xy[0], cov_xy[1], cov_z], mech_r, mech_h) {
+                    continue;
+                }
+                if !self.has_shot_los([peek_xy[0], peek_xy[1], peek_z + mech_muz_h], enemy_center) {
+                    continue;
+                }
+                out.push(([cov_xy[0], cov_xy[1], cov_z], [peek_xy[0], peek_xy[1], peek_z]));
+                if out.len() >= 8 {
+                    return out;
+                }
+            }
+        }
+        out
+    }
+
     /// Fast 2D A* on the 8m navigation grid with dynamic mech radius/height (cube-safe bridges!) & closed skip!
     pub fn next_waypoint(&self, from: [f64; 2], to: [f64; 2], feet_z: f64) -> [f64; 2] {
         self.next_waypoint_sized(from, to, feet_z, 2.7, 9.2, 1.2)
@@ -1380,14 +1531,21 @@ impl ArenaMap {
         step_up: f64,
     ) -> [f64; 2] {
         let d = (to[0] - from[0]).hypot(to[1] - from[1]);
-        if d < 5.0 {
+        if d < 0.5 {
             return to;
         }
-        // Check straight segment using ground tz (fixes downhill wall-blindness!)
-        let sample_n = (d / 4.0).ceil().clamp(2.0, 24.0) as usize;
-        let mut clear = true;
         let from_tz = self.terrain_z(from[0], from[1]);
         let on_roof = feet_z > from_tz + 3.0;
+        if !on_roof {
+            if d <= 52.0 && self.is_ground_segment_clear(from, to, feet_z, mech_r, mech_h, step_up) {
+                return to;
+            }
+        } else if d < 5.0 {
+            return to;
+        }
+        // Fallback straight check for long paths or rooftops
+        let sample_n = (d / 3.5).ceil().clamp(2.0, 32.0) as usize;
+        let mut clear = true;
         for i in 1..sample_n {
             let frac = i as f64 / sample_n as f64;
             let sx = from[0] + (to[0] - from[0]) * frac;
@@ -1515,16 +1673,21 @@ impl ArenaMap {
         let mut chosen = scratch.path[0];
         for &cell_idx in scratch.path.iter().take(6) {
             let wp = self.cell_to_world(cell_idx);
-            let mut seg_ok = true;
-            for &frac in &[0.33, 0.67] {
-                let sx = from[0] + (wp[0] - from[0]) * frac;
-                let sy = from[1] + (wp[1] - from[1]) * frac;
-                let tz = self.terrain_z(sx, sy);
-                if self.is_cylinder_blocked(sx, sy, tz, mech_r + 0.2, mech_h, step_up) {
-                    seg_ok = false;
-                    break;
+            let seg_ok = if !on_roof {
+                self.is_ground_segment_clear(from, wp, feet_z, mech_r, mech_h, step_up)
+            } else {
+                let mut ok = true;
+                for &frac in &[0.33, 0.67] {
+                    let sx = from[0] + (wp[0] - from[0]) * frac;
+                    let sy = from[1] + (wp[1] - from[1]) * frac;
+                    let tz = self.terrain_z(sx, sy);
+                    if self.is_cylinder_blocked(sx, sy, tz, mech_r + 0.2, mech_h, step_up) {
+                        ok = false;
+                        break;
+                    }
                 }
-            }
+                ok
+            };
             if seg_ok {
                 chosen = cell_idx;
             } else {
@@ -1561,11 +1724,18 @@ impl ArenaMap {
             let idx = uy * self.nav_nx + ux;
             self.nav_walkable[idx] && self.nav_headroom[idx] >= need_hr
         };
-        if ok(ix, iy) {
-            return (ix, iy);
-        }
         let on_ground = feet_z <= self.terrain_z(p[0], p[1]) + 2.5;
         let p_eye = [p[0], p[1], feet_z + 3.0];
+        if ok(ix, iy) {
+            if !on_ground {
+                return (ix, iy);
+            }
+            let w0 = self.cell_to_world(iy * self.nav_nx + ix);
+            let wz0 = self.nav_z[iy * self.nav_nx + ix];
+            if self.has_shot_los(p_eye, [w0[0], w0[1], wz0 + 3.0]) {
+                return (ix, iy);
+            }
+        }
         let mut fallback: Option<(usize, usize)> = None;
         let mut los_checks = 0usize;
         for rad in 1..=8isize {

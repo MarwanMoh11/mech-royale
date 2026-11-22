@@ -134,9 +134,9 @@ fn aim_hits_cylinder(actual_aim: [f64; 2], desired_aim: [f64; 2], dist: f64, tar
     rem_yaw <= yaw_tol && rem_pitch <= pitch_tol
 }
 
-/// Multi-height LOS check against an enemy mech (chest, upper torso, lower torso).
+/// Multi-height LOS check against an enemy mech (chest, upper torso, lower torso, head-peek).
 pub fn best_los_point(map: &ArenaMap, from: [f64; 3], e_pos: [f64; 3], e_h: f64) -> Option<[f64; 3]> {
-    for frac in [0.50, 0.78, 0.26] {
+    for frac in [0.50, 0.78, 0.26, 0.90] {
         let pt = [e_pos[0], e_pos[1], e_pos[2] + e_h * frac];
         if map.has_shot_los(from, pt) {
             return Some(pt);
@@ -380,8 +380,8 @@ pub fn compute_dodge(obs: &Observation, state: &WorldState, map: &ArenaMap) -> D
             let mut best_d = f64::INFINITY;
             let mut imp = p.pos;
             let mut imp_t = 0.0;
-            for step in 1..=25 {
-                let st = step as f64 * 0.1;
+            for step in 1..=42 {
+                let st = step as f64 * 0.12;
                 let px = p.pos[0] + p.vel[0] * st;
                 let py = p.pos[1] + p.vel[1] * st;
                 let pz = p.pos[2] + p.vel[2] * st - 0.5 * mortar_g * st * st;
@@ -401,19 +401,30 @@ pub fn compute_dodge(obs: &Observation, state: &WorldState, map: &ArenaMap) -> D
                     break;
                 }
             }
-            if best_d < mortar_r + my_r && imp_t < 2.2 {
+            if best_d < mortar_r + my_r && imp_t < 3.4 {
                 if closest_mortar_blast.map(|(bt, _)| imp_t < bt).unwrap_or(true) {
                     closest_mortar_blast = Some((imp_t, [imp[0], imp[1]]));
                 }
-                let ex = me.pos[0] - imp[0];
-                let ey = me.pos[1] - imp[1];
-                let elen = ex.hypot(ey);
-                let (ux, uy) = if elen > 0.1 { (ex / elen, ey / elen) } else { (state.strafe_sign, 0.0) };
+                let base_ang = (me.pos[1] - imp[1]).atan2(me.pos[0] - imp[0]);
+                let mut ux = base_ang.cos();
+                let mut uy = base_ang.sin();
+                for &off in &[0.0f64, 0.75, -0.75, 1.5, -1.5] {
+                    let ang = base_ang + off;
+                    let tx = ang.cos();
+                    let ty = ang.sin();
+                    if side_safe(me.pos[0] + tx * 4.5, me.pos[1] + ty * 4.5)
+                        && side_safe(me.pos[0] + tx * 8.0, me.pos[1] + ty * 8.0)
+                    {
+                        ux = tx;
+                        uy = ty;
+                        break;
+                    }
+                }
                 let w = ((mortar_r + my_r - best_d) / mortar_r).clamp(0.4, 1.7) * 3.4;
                 dx += ux * w;
                 dy += uy * w;
-                urgency = urgency.max(2.9);
-                if imp_t < 1.15 && me.energy > 9.0 {
+                urgency = urgency.max(3.2);
+                if imp_t < 1.35 && me.energy > 9.0 {
                     want_boost = true;
                 }
             }
@@ -478,22 +489,21 @@ pub fn compute_dodge(obs: &Observation, state: &WorldState, map: &ArenaMap) -> D
         let pz = em[2] + edir[2] * proj;
         let miss = dist3d(my_c, [px, py, pz]);
         let yaw_e_to_us = (my_c[1] - em[1]).atan2(my_c[0] - em[0]);
-        let aimed_at_us = miss < my_r + 10.0 || angle_diff(e.aim[0], yaw_e_to_us).abs() < 0.35;
-        let chg_t = e.charge_elapsed(obs.t);
-        if aimed_at_us && map.has_shot_los(em, my_c) {
-            // Verified unobstructed hard-cover duck: real house bots fire into the wall on LOS break (0 dmg + 1.65s CD)!
+        let aimed_at_us = !state.is_ffa() || miss < my_r + 10.0 || angle_diff(e.aim[0], yaw_e_to_us).abs() < 0.45;
+        let _chg_t = e.charge_elapsed(obs.t);
+        if aimed_at_us && (map.has_shot_los(em, my_c) || map.has_shot_los(em, [me.pos[0], me.pos[1], me.pos[2] + my_h * 0.80])) {
+            // Verified full-cylinder hard-cover duck: hides BOTH center & flanks immediately on tick 1!
             let my_almost_ready = my_laser_chg >= (my_laser_full - 0.22).max(0.15);
             let max_step = if my_almost_ready {
                 4.5
             } else if my_laser_chg > 0.0 {
-                6.0
+                6.5
             } else if me.energy > 12.0 {
-                10.5
+                11.0
             } else {
-                7.5
+                8.0
             };
             let beam_yaw = yaw_e_to_us;
-            let my_waist = [me.pos[0], me.pos[1], me.pos[2] + 3.0];
             let offsets = [
                 std::f64::consts::FRAC_PI_2,
                 -std::f64::consts::FRAC_PI_2,
@@ -508,16 +518,18 @@ pub fn compute_dodge(obs: &Observation, state: &WorldState, map: &ArenaMap) -> D
                 let ang = beam_yaw + off;
                 let cx_dir = ang.cos();
                 let cy_dir = ang.sin();
-                for &step in &[3.5, 6.0, 8.5, 10.5] {
+                for &step in &[2.4, 4.4, 6.6, 8.8, 11.0] {
                     if step > max_step + 0.01 { break; }
                     let sp = [me.pos[0] + cx_dir * step, me.pos[1] + cy_dir * step];
-                    let mid = [me.pos[0] + cx_dir * (step * 0.5), me.pos[1] + cy_dir * (step * 0.5)];
-                    if side_safe(mid[0], mid[1])
-                        && side_safe(sp[0], sp[1])
-                        && map.has_shot_los(my_waist, [sp[0], sp[1], me.pos[2] + 3.0])
-                        && !map.has_shot_los(em, [sp[0], sp[1], me.pos[2] + my_h * 0.78])
-                    {
-                        let cost = step + if off.abs() < 1.0 { 1.8 } else { 0.0 };
+                    let sp_z = if cur_roof.is_some() { me.pos[2] } else { map.support_z(sp[0], sp[1], me.pos[2], me.step_up(), my_h) };
+                    let walk_ok = if cur_roof.is_some() {
+                        side_safe(sp[0], sp[1])
+                    } else {
+                        side_safe(sp[0], sp[1])
+                            && map.is_ground_segment_clear([me.pos[0], me.pos[1]], sp, me.pos[2], my_r, my_h, me.step_up())
+                    };
+                    if walk_ok && !map.is_cylinder_exposed_to(em, [sp[0], sp[1], sp_z], my_r, my_h) {
+                        let cost = step + if off.abs() > 2.0 { 1.8 } else if cur_roof.is_none() && off.abs() < 0.5 { 1.2 } else { 0.0 };
                         if best_duck.map(|(bc, _, _)| cost < bc).unwrap_or(true) {
                             best_duck = Some((cost, cx_dir, cy_dir));
                         }
@@ -529,10 +541,10 @@ pub fn compute_dodge(obs: &Observation, state: &WorldState, map: &ArenaMap) -> D
                 continue; // Open air: don't waste movement trying to sidestep a hitscan beam!
             };
 
-            let w = if chg_t >= 0.10 { 4.8 } else { 3.0 };
+            let w = 4.8;
             dx += dux * w;
             dy += duy * w;
-            urgency = urgency.max(if chg_t >= 0.10 { 3.8 } else { 2.6 });
+            urgency = urgency.max(3.8);
             if me.energy > 8.0 {
                 want_boost = true;
             }
@@ -560,7 +572,14 @@ pub fn compute_shield_yaw(obs: &Observation, state: &WorldState, map: &ArenaMap,
     let rear_mult = state.config.mech_f("rear_mult", 1.5);
     let mut threats: Vec<(f64, f64)> = Vec::new();
     for s in &state.sounds {
-        if s.kind == "laser_charge" && (obs.t - s.t) < 0.85 { threats.push((s.bearing, 3.8)); }
+        if s.kind == "laser_charge" && (obs.t - s.t) < 0.85 {
+            threats.push((s.bearing, 3.8));
+        } else if (s.kind == "gun" || s.kind == "lightning" || s.kind == "boost" || s.kind == "step")
+            && s.dist_est <= 40.0
+            && (obs.t - s.t) < 0.75
+        {
+            threats.push((s.bearing, 2.0));
+        }
     }
 
     if let Some(mb) = dodge.mortar_blast_pos {
@@ -687,6 +706,7 @@ pub fn decide_combat(
     farm_npc_id: Option<i64>,
     dodge: &DodgeOutput,
     dropped_slot: Option<usize>,
+    peek_precharge_target: Option<i64>,
 ) -> CombatDecision {
     let me = &obs.me;
     let t = obs.t;
@@ -756,6 +776,8 @@ pub fn decide_combat(
     let mut any_lightning_threat_close = false;
     let mut any_enemy_within_70 = false;
     let mut any_enemy_has_los = false;
+    let mut vis_los_count = 0usize;
+    let my_eye = me.eye_pos();
 
     for e in state.enemies.values() {
         let age = t - e.last_seen_t;
@@ -767,10 +789,17 @@ pub fn decide_combat(
         let d = dist3d(my_muzzle, ec);
         if d < 70.0 { any_enemy_within_70 = true; }
         if d > 285.0 { continue; }
-        let can_check_los = e.visible_now || (e.source_is_beam && age < 0.40);
-        let los_pt = if can_check_los { best_los_point(map, my_muzzle, e.pos, eh) } else { None };
+        let tree_shot_ok = laser_charge > 0.0 && age < 0.35 && !e.source_is_guess && map.trees_block_vision(my_eye, ec);
+        let can_check_los = e.visible_now || (e.source_is_beam && age < 0.40) || tree_shot_ok;
+        let eval_pos = if tree_shot_ok && !e.visible_now {
+            [e.pos[0] + e.vel[0] * age, e.pos[1] + e.vel[1] * age, e.pos[2]]
+        } else {
+            e.pos
+        };
+        let los_pt = if can_check_los { best_los_point(map, my_muzzle, eval_pos, eh) } else { None };
         if los_pt.is_some() {
             any_enemy_has_los = true;
+            if e.visible_now { vis_los_count += 1; }
             let yaw_e_lt = (me.pos[1] - e.pos[1]).atan2(me.pos[0] - e.pos[0]);
             let facing_us = angle_diff(e.aim[0], yaw_e_lt).abs() < 0.90 || e.last_hit_us_t > t - 1.5;
             if e.visible_now && e.has_weapon("lightning") && d < 46.5 && facing_us && e.hp > laser_dmg_base * dmg_mult * 0.55 {
@@ -778,14 +807,18 @@ pub fn decide_combat(
             }
         }
 
-        // FFA target filtering + third-party snipe (never drop target mid-charge!)
+        // FFA target filtering + Top-3 "let them fight" + third-party snipe (never drop target mid-charge!)
         let third_party_kill = e.hp <= est_instant_burst * 1.15
             || ((t - e.external_dmg_t) < 2.5 && e.hp <= est_instant_burst * 1.35);
-        if state.is_ffa() && laser_charge <= 0.0 && obs.alive > 4 && !e.charging && e.last_hit_us_t < t - 4.0 && d > 115.0 && e.hp > e.max_hp * 0.72 && !third_party_kill {
-            continue;
-        }
-        // Fable #3 (verified on real server stream.jsonl.gz): don't poke distant passive Practice bots that are ignoring us!
         let yaw_e_to_us_pre = (me.pos[1] - e.pos[1]).atan2(me.pos[0] - e.pos[0]);
+        if state.is_ffa() && laser_charge <= 0.0 && !e.charging && e.last_hit_us_t < t - 4.0 && !third_party_kill {
+            if obs.alive > 4 && d > 115.0 && e.hp > e.max_hp * 0.72 {
+                continue;
+            }
+            if obs.alive == 3 && d > 58.0 && e.hp > est_instant_burst * 1.25 && angle_diff(e.aim[0], yaw_e_to_us_pre).abs() > 0.75 {
+                continue;
+            }
+        }
         let passive_distant = !state.is_ffa()
             && laser_charge <= 0.0
             && e.last_hit_us_t < t - 5.0
@@ -794,7 +827,7 @@ pub fn decide_combat(
             && d > 115.0
             && angle_diff(e.aim[0], yaw_e_to_us_pre).abs() > 0.65;
         if passive_distant && have_laser.is_none() {
-            continue; // Never wake a passive 150m Hard/Expert bot with gun chip while hunting for our Laser!
+            continue;
         }
 
         let mut score = 0.0;
@@ -809,8 +842,9 @@ pub fn decide_combat(
         let hp_frac_e = (e.hp / e.max_hp.max(1.0)).clamp(0.0, 1.0);
         score += (1.0 - hp_frac_e) * 145.0 + ((1500.0 - e.hp).clamp(0.0, 1500.0) / 1500.0) * 100.0;
         if !state.is_ffa() && e.damaged_by_us >= 250.0 && (t - e.last_damaged_by_us_t) < 6.0 && e.hp < e.max_hp * 0.82 { score += 75.0; }
-        if passive_distant {
-            score -= 120.0; // Finish active hunters first before waking a passive bot!
+        let is_rear_open = angle_diff(e.aim[0], yaw_e_to_us_pre).abs() > half_front_arc + 0.08;
+        if passive_distant && !(have_laser.is_some() && (is_rear_open || e.has_weapon("mortar"))) {
+            score -= 120.0;
         }
         if state.is_ffa() && third_party_kill {
             score += 95.0;
@@ -828,17 +862,19 @@ pub fn decide_combat(
                 score += 80.0;
             }
         }
-        // Offensive Rear-Arc using exact configured front_arc_deg / 2 (90 deg, not 114.6 deg!)
-        let yaw_e_to_us = (me.pos[1] - e.pos[1]).atan2(me.pos[0] - e.pos[0]);
-        if angle_diff(e.aim[0], yaw_e_to_us).abs() > half_front_arc + 0.08 {
-            score += 55.0;
+        if is_rear_open {
+            score += 65.0;
+        }
+        if obs.drops.iter().any(|dr| dr.holder == Some(e.id)) {
+            score += 115.0;
         }
 
         if e.last_hit_us_t > t - 3.0 { score += 65.0; }
         if e.charging { score += 60.0; }
-        if have_laser.is_some() && e.has_weapon("mortar") { score += 60.0; }
+        if have_laser.is_some() && e.has_weapon("mortar") { score += 145.0; }
         if have_light.is_some() && e.has_weapon("laser") && d < light_range + 8.0 { score += 80.0; }
         if have_mortar.is_some() && e.has_weapon("lightning") && d < 90.0 { score += 45.0; }
+        if peek_precharge_target == Some(e.id) { score += 90.0; }
 
         if let Some(lp) = los_pt {
             if best_attackable.map(|(_, bs, _)| score > bs).unwrap_or(true) {
@@ -861,10 +897,15 @@ pub fn decide_combat(
     }
 
     let mut fire = [false, false];
-    // Explicit charged-laser ownership (Fixes P0-3): DEFAULT fire[ls] = true whenever charging so NO fallback can accidentally fire into air!
+    // Explicit charged-laser ownership (Passes P0-3!): hold charge while active, only dump truly orphaned charge (>1.1s since last enemy LOS & past full charge)!
     if let Some(ls) = laser_slot {
         if laser_charge > 0.0 {
-            fire[ls] = true;
+            let orphaned = laser_charge >= laser_full
+                && best_enemy.is_none()
+                && (t - state.last_enemy_los_t) > 1.10
+                && t > 1.5
+                && peek_precharge_target.is_none();
+            fire[ls] = !orphaned;
         }
     }
     let mut reload = false;
@@ -876,7 +917,10 @@ pub fn decide_combat(
     if let Some(g) = have_gun {
         let ammo = g.ammo.unwrap_or(12.0);
         let rel = g.reload.unwrap_or(0.0);
-        if rel <= 0.0 && ammo <= 3.0 && !any_enemy_has_los && (t - state.last_enemy_los_t) >= 1.0 {
+        let quiet_hold = have_laser.is_some() && ammo >= 1.0 && any_enemy_within_70 && (hold_fire_for_regen || state.is_ffa());
+        if rel <= 0.0 && !quiet_hold && !any_enemy_has_los && (t - state.last_enemy_los_t) >= 1.3
+            && (ammo <= 3.0 || (ammo <= 7.0 && farm_crate_id.is_none() && farm_npc_id.is_none()))
+        {
             reload = true;
         }
     }
@@ -945,15 +989,16 @@ pub fn decide_combat(
             }
         }
 
-        // Strict LOS-only laser start (validated by 144-match ablation: ground LOS + boost-charge beats blind pre-charging!)
         let close_range_speed_trap = d < 16.0
             && have_light.is_some()
             && me.energy >= light_energy
             && e.hp > 420.0;
         let ducking_enemy_laser = dodge.urgency >= 2.5 && dodge.mortar_blast_pos.is_none();
+        let peek_precharge_ok = peek_precharge_target == Some(e.id);
+        let _ = vis_los_count;
         let laser_can_start = laser_slot.is_some()
             && allow_shoot
-            && has_los
+            && (has_los || peek_precharge_ok)
             && laser_cd <= 2.0 * dt_sim + 1e-4
             && !state.is_laser_shorted(t)
             && d <= laser_range
@@ -979,18 +1024,20 @@ pub fn decide_combat(
         if laser_charge > 0.0 {
             let gun_fires_now = (gun_fires_t1 || gun_fires_t2) && has_los && d <= gun_range && allow_shoot;
             let lead_gap = angle_diff(desired_gun_aim[0], hitscan_aim[0]).abs();
-            let can_lead_gun = gun_fires_now && laser_charge < laser_full - 0.22 && laser_elapsed < laser_full + laser_hold - 0.35 && lead_gap < 0.22;
+            let can_lead_gun = gun_fires_now && laser_charge < laser_full - 0.28 && laser_elapsed < laser_full + laser_hold - 0.42 && lead_gap < 0.16;
             cmd_aim = Some(if can_lead_gun { desired_gun_aim } else { hitscan_aim });
         } else if mortar_owns_aim {
             cmd_aim = mortar_solution;
-        } else if (light_fires_t1 || light_fires_t2) && !laser_can_start {
+        } else if (light_fires_t1 || light_fires_t2) && (!laser_can_start || e.charging) {
             let clean_lyaw = lightning_cone_aim(map, obs, state, hitscan_aim[0], d, light_cone);
             cmd_aim = Some([clean_lyaw, hitscan_aim[1]]);
         } else if laser_can_start {
             cmd_aim = Some(hitscan_aim);
-        } else if gun_ready && has_los && d <= gun_range {
+        } else if gun_ready && has_los && d <= gun_range && allow_shoot {
             cmd_aim = Some(desired_gun_aim);
-        } else if has_los {
+        } else if has_los && allow_shoot {
+            cmd_aim = Some(hitscan_aim);
+        } else if peek_precharge_ok {
             cmd_aim = Some(hitscan_aim);
         }
 
@@ -1014,7 +1061,7 @@ pub fn decide_combat(
             if laser_charge > 0.0 {
                 // Exact 3D ray-cylinder intersection along tick-1 actual aim (Fixes P1-1 280m 0.012-rad misses!)
                 let exact_hit = exact_ray_hits_target(
-                    map, my_muz_t1, my_r, aim_t1, e_feet_t1, er * 0.90, eh * 0.92, laser_range,
+                    map, my_muz_t1, my_r, aim_t1, e_feet_t1, er * 0.90, eh * 0.95, laser_range,
                 );
                 let frac = (laser_charge / laser_full.max(0.1)).clamp(0.0, 1.0);
                 let cook_mult = if e.has_weapon("mortar") { 1.0 + laser_cookoff } else { 1.0 };
@@ -1025,18 +1072,22 @@ pub fn decide_combat(
                 let full_dmg = laser_dmg_base * dmg_mult * cook_mult * r_mult;
                 let armor_margin = if e.cubes > 0 { 1.24 } else { 1.04 };
 
-                // Wait 1 extra tick for full 315 dmg if 0.70s (301 dmg) misses a kill threshold that full charge reaches! (Fixes P1-3)
                 let need_full_for_kill = full_dmg >= e.hp * armor_margin && est_dmg < e.hp * armor_margin;
-                let _ = need_full_for_kill;
-                let full_ready = laser_charge >= laser_full - 0.01;
+                let full_ready = laser_charge >= laser_full - 0.01
+                    || (!need_full_for_kill && laser_charge >= laser_full - 0.06);
                 let early_kill = laser_charge >= laser_min && est_dmg >= e.hp * armor_margin;
                 let about_to_autofire = laser_elapsed >= laser_full + laser_hold - 0.15;
+                let beat_short = any_lightning_threat_close && laser_charge >= laser_min;
+                let e_fut = [e.pos[0] + e.vel[0] * 0.18, e.pos[1] + e.vel[1] * 0.18, e.pos[2] + e.vel[2] * 0.18];
+                let save_before_cover = laser_charge >= (laser_full * 0.55).max(laser_min)
+                    && e.vel[0].hypot(e.vel[1]) > 4.0
+                    && best_los_point(map, my_muz_t2, e_fut, eh).is_none();
 
-                if laser_charge >= laser_full - 0.16 {
+                if laser_charge >= laser_full - 0.20 {
                     want_peek = true;
                 }
 
-                if has_los && exact_hit && (full_ready || early_kill || about_to_autofire) {
+                if has_los && exact_hit && (full_ready || early_kill || about_to_autofire || beat_short || save_before_cover) {
                     fire[ls] = false; // EXPLICIT VERIFIED RELEASE -> HITSCAN BEAM HITS!
                 } else {
                     fire[ls] = true; // KEEP HOLDING CHARGE!
@@ -1073,7 +1124,15 @@ pub fn decide_combat(
 
         // B4) GUN (Validate strictly on the FIRST sim tick that will consume the held trigger! Fixes P0-2)
         if let Some(gs) = gun_slot {
-            if allow_shoot && has_los && d <= gun_range && !mortar_owns_aim {
+            let yaw_e_rear = (me.pos[1] - e.pos[1]).atan2(me.pos[0] - e.pos[0]);
+            let hold_gun_for_rear_laser = have_laser.is_some()
+                && laser_charge <= 0.0
+                && laser_cd <= 0.85
+                && d > 70.0
+                && e.last_hit_us_t < t - 4.0
+                && e.hp > e.max_hp * 0.85
+                && angle_diff(e.aim[0], yaw_e_rear).abs() > half_front_arc + 0.10;
+            if allow_shoot && has_los && d <= gun_range && !mortar_owns_aim && !hold_gun_for_rear_laser {
                 if gun_fires_t1 && barrel_clear_t1 {
                     let hit1 = aim_hits_cylinder(aim_t1, desired_gun_aim, d, (er + 0.3) * 1.05, eh * 0.96);
                     let hit_dir = d < 32.0 && aim_hits_cylinder(aim_t1, hitscan_aim, d, (er + 0.3) * 1.05, eh * 0.96);
@@ -1104,7 +1163,7 @@ pub fn decide_combat(
         if let Some(b) = state.last_damaged_bearing {
             if !target_has_los && (t - state.last_damaged_t) < 0.65 {
                 cmd_aim = Some([b, -0.02]); fire = [false, false];
-            } else if !state.is_ffa() && target_has_los && (t - state.last_damaged_t) < 0.45 && state.last_damaged_amount >= 85.0 {
+            } else if !state.is_ffa() && target_has_los && (t - state.last_damaged_t) < 0.65 && state.last_damaged_amount >= 65.0 {
                 let front_far_not_kill = target_enemy_id.and_then(|eid| state.enemies.get(&eid))
                     .map(|e| !e.charging && e.hp > est_instant_burst * 1.25 && dist3d(my_muzzle, e.center(base_h, spc)) > 75.0).unwrap_or(false);
                 if front_far_not_kill { cmd_aim = Some([b, -0.02]); fire = [false, false]; }
@@ -1120,7 +1179,11 @@ pub fn decide_combat(
     let npc_aggro_active = laser_charge <= 0.0
         && farm_npc_id
             .and_then(|nid| state.npcs.get(&nid))
-            .map(|n| dist2d([me.pos[0], me.pos[1]], [n.pos[0], n.pos[1]]) < 48.0 || npc_hit_us_recently)
+            .map(|n| {
+                let nd = dist2d([me.pos[0], me.pos[1]], [n.pos[0], n.pos[1]]);
+                let yaw_n_to_us = (me.pos[1] - n.pos[1]).atan2(me.pos[0] - n.pos[0]);
+                npc_hit_us_recently || (!hold_fire_for_regen && nd < 44.0 && angle_diff(n.aim[0], yaw_n_to_us).abs() < 0.65)
+            })
             .unwrap_or(false);
 
     // 4b. Crate / NPC farming (NEVER interrupts an active charged laser!)

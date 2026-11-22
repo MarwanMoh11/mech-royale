@@ -463,6 +463,8 @@ pub struct BeamObs {
 pub struct GameEvent {
     #[serde(rename = "type", default)]
     pub kind: String,
+    #[serde(rename = "kind", default)]
+    pub item_kind: Option<String>,
     #[serde(default)]
     pub amount: Option<f64>,
     #[serde(default)]

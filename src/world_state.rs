@@ -230,6 +230,10 @@ pub struct WorldState {
     pub stuck_streak: u32,
     pub last_stuck_pos: [f64; 2],
     pub zone_boost_active: bool,
+    pub travel_boost_active: bool,
+    pub sculpt_target_cubes: Option<i64>,
+    pub sculpt_dropped_t: f64,
+    pub sculpt_gun_id: Option<i64>,
     // Rooftop climb, roof-hop & tactical goal hysteresis
     pub climb_state: Option<ClimbState>,
     pub roof_hop: Option<RoofHopState>,
@@ -294,6 +298,10 @@ impl WorldState {
             stuck_streak: 0,
             last_stuck_pos: [1e9, 1e9],
             zone_boost_active: false,
+            travel_boost_active: false,
+            sculpt_target_cubes: None,
+            sculpt_dropped_t: -100.0,
+            sculpt_gun_id: None,
             climb_state: None,
             roof_hop: None,
             climb_cooldown_until: -10.0,
@@ -392,6 +400,12 @@ impl WorldState {
                             if let Some(tr) = self.enemies.get_mut(&tid) {
                                 tr.last_damaged_by_us_t = t;
                                 tr.damaged_by_us += amt;
+                                if ev.effect.as_deref() == Some("short") {
+                                    let short_s = self.config.weapon_f("lightning", "short_s", 2.0);
+                                    tr.laser_ready_t = tr.laser_ready_t.max(t + short_s);
+                                    tr.charging = false;
+                                    tr.charge_start_t = None;
+                                }
                             }
                         }
                     }
@@ -422,6 +436,17 @@ impl WorldState {
                 "took" => {
                     if let Some(pid) = ev.id.as_ref().and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)).or_else(|| v.as_f64().map(|f| f.round() as i64))) {
                         self.pickups.remove(&pid);
+                        if self.sculpt_gun_id == Some(pid) {
+                            self.sculpt_gun_id = None;
+                            self.sculpt_target_cubes = None;
+                        }
+                    }
+                }
+                "dropped" => {
+                    if ev.item_kind.as_deref() == Some("gun") {
+                        if let Some(pid) = ev.id.as_ref().and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)).or_else(|| v.as_f64().map(|f| f.round() as i64))) {
+                            self.sculpt_gun_id = Some(pid);
+                        }
                     }
                 }
                 "take_failed" => {
@@ -518,9 +543,12 @@ impl WorldState {
                     && !tr.source_is_guess
                 {
                     tr.external_dmg_t = t;
-                    // > 175 HP burst inside zone not from us and not from a 25-dmg NPC = confirmed mech-vs-mech FFA!
-                    if hp_drop > us_dmg + 175.0 {
-                        self.ffa_confirmed = true;
+                    // > 230 HP non-mortar burst inside zone not from us = confirmed mech-vs-mech FFA!
+                    if hp_drop > us_dmg + 230.0 && !tr.has_weapon("mortar") {
+                        self.ffa_evidence += 1.0;
+                        if self.ffa_evidence >= 2.0 {
+                            self.ffa_confirmed = true;
+                        }
                     }
                 }
                 tr.prev_hp = tr.hp;
@@ -598,6 +626,21 @@ impl WorldState {
                 continue;
             }
             let fired_t = (t - b.age).max(0.0);
+            // Zero-FP Beam FFA Detection: enemy beam terminating directly on ANOTHER enemy mech!
+            if let Some(&pend) = b.path.last() {
+                for a in &obs.mechs {
+                    if a.id != obs.me.id && a.id != b.by && a.is_mech() {
+                        let ac = [a.pos[0], a.pos[1], a.pos[2] + base_h * 0.5];
+                        if dist3d(pend, ac) < 4.5 {
+                            self.ffa_confirmed = true;
+                            if let Some(tr) = self.enemies.get_mut(&a.id) {
+                                tr.external_dmg_t = t;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
             if b.kind == "laser" {
                 if let Some(tr) = self.enemies.get_mut(&b.by) {
                     tr.laser_ready_t = tr.laser_ready_t.max(fired_t + enemy_laser_cd);
@@ -624,11 +667,17 @@ impl WorldState {
             // Use known cube scale if enemy was previously tracked (P2-5)
             let prev_sc = self.enemies.get(&b.by).map(|e| e.scale(spc)).unwrap_or(1.0);
             let back_off = base_r * prev_sc + 0.5;
-            let est_mx = p0[0] - ux * back_off;
-            let est_my = p0[1] - uy * back_off;
+            let mut est_mx = p0[0] - ux * back_off;
+            let mut est_my = p0[1] - uy * back_off;
             let est_mz = p0[2] - uz * back_off;
-            let tz = map.terrain_z(est_mx, est_my);
-            let est_feet_z = (est_mz - base_muz * prev_sc).max(tz);
+            let mut tz = map.terrain_z(est_mx, est_my);
+            let mut est_feet_z = (est_mz - base_muz * prev_sc).max(tz);
+            if map.is_cylinder_blocked(est_mx, est_my, est_feet_z + 0.1, 1.5, 4.0, 1.0) {
+                est_mx = p0[0];
+                est_my = p0[1];
+                tz = map.terrain_z(est_mx, est_my);
+                est_feet_z = (p0[2] - base_muz * prev_sc).max(tz);
+            }
             let beam_aim = [uy.atan2(ux), uz.atan2(ux.hypot(uy).max(1e-6))];
             let seen_t = (t - b.age).max(0.0);
 
@@ -744,21 +793,15 @@ impl WorldState {
         if non_self_deaths > self.prev_non_self_deaths {
             self.prev_non_self_deaths = non_self_deaths;
         }
-        if (non_self_deaths >= 2 && t < 115.0)
-            || (non_self_deaths >= 3 && t < 155.0)
-            || (non_self_deaths >= 1 && t < 75.0 && obs.zone.radius > 300.0)
-        {
-            self.ffa_confirmed = true;
-        }
-        if self.ffa_confirmed
-            || (non_self_deaths >= 1 && obs.zone.radius > 165.0 && t < 110.0)
-            || (non_self_deaths >= 2 && t < 165.0)
+        if (non_self_deaths >= 2 && t < 80.0 && obs.zone.radius > 280.0)
+            || (non_self_deaths >= 3 && t < 130.0 && obs.zone.radius > 165.0)
+            || (non_self_deaths >= 4 && t < 185.0)
         {
             self.ffa_confirmed = true;
         }
         self.mode = if self.ffa_confirmed {
             MatchMode::Ffa
-        } else if t >= 25.0 && non_self_deaths == 0 {
+        } else if t >= 20.0 && non_self_deaths <= 1 {
             MatchMode::Practice1v15
         } else {
             MatchMode::Unknown
@@ -823,7 +866,8 @@ impl WorldState {
             if vis_pickup_ids.contains(id) { return true; }
             if t - p.last_seen_t > 240.0 { return false; }
             if p.kind == "laser" && (p.pos[2] - obs.me.pos[2]).abs() > 3.5 && dist2d([obs.me.pos[0], obs.me.pos[1]], [p.pos[0], p.pos[1]]) > 12.0 { return true; }
-            !do_evict || !should_be_visible(p.pos, 0.25)
+            let close_evict = dist2d([obs.me.pos[0], obs.me.pos[1]], [p.pos[0], p.pos[1]]) < 36.0;
+            !(do_evict || close_evict) || !should_be_visible(p.pos, 0.25)
         });
 
         let vis_crate_ids: Vec<i64> = obs.crates.iter().map(|c| c.id).collect();
@@ -836,7 +880,8 @@ impl WorldState {
         self.crates.retain(|id, c| {
             if vis_crate_ids.contains(id) { return true; }
             if t - c.last_seen_t > 18.0 { return false; }
-            !do_evict || !should_be_visible(c.pos, 1.2)
+            let close_evict = dist2d([obs.me.pos[0], obs.me.pos[1]], [c.pos[0], c.pos[1]]) < 36.0;
+            !(do_evict || close_evict) || !should_be_visible(c.pos, 1.2)
         });
 
         let vis_cube_ids: Vec<i64> = obs.cubes.iter().map(|c| c.id).collect();
@@ -849,7 +894,8 @@ impl WorldState {
         self.cubes.retain(|id, c| {
             if vis_cube_ids.contains(id) { return true; }
             if t - c.last_seen_t > 15.0 { return false; }
-            !do_evict || !should_be_visible(c.pos, 0.8)
+            let close_evict = dist2d([obs.me.pos[0], obs.me.pos[1]], [c.pos[0], c.pos[1]]) < 36.0;
+            !(do_evict || close_evict) || !should_be_visible(c.pos, 0.8)
         });
 
         // 6. Stuck detection
