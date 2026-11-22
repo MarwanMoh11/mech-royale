@@ -868,7 +868,17 @@ pub fn decide_combat(
     if let Some(g) = have_gun {
         let ammo = g.ammo.unwrap_or(12.0);
         let rel = g.reload.unwrap_or(0.0);
-        if rel <= 0.0 && ammo <= 3.0 && !any_enemy_has_los && (t - state.last_enemy_los_t) >= 1.0 {
+        let rel_thresh = if !state.is_ffa() && farm_crate_id.is_none() && farm_npc_id.is_none() {
+            7.0
+        } else {
+            3.0
+        };
+        let rel_delay = if !state.is_ffa() && farm_crate_id.is_none() && farm_npc_id.is_none() {
+            1.2
+        } else {
+            1.0
+        };
+        if rel <= 0.0 && ammo <= rel_thresh && !any_enemy_has_los && (t - state.last_enemy_los_t) >= rel_delay {
             reload = true;
         }
     }

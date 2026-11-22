@@ -71,10 +71,10 @@ fn target_pos_reachable(
     (pos[2] - obs.me.pos[2]).abs() < 4.0
 }
 
-/// Cube farming cap: 15 cubes in Practice (5th upgrade + late supply drops!), 10 in FFA (avoid hitbox bloat!)
+/// Cube farming cap: 10 cubes (hits stat_cap=10 + 4th upgrade @10 while avoiding 15-cube hitbox bloat!)
 #[inline]
-fn cube_farm_cap(state: &WorldState) -> i64 {
-    if state.is_ffa() { 10 } else { 15 }
+fn cube_farm_cap(_state: &WorldState) -> i64 {
+    10
 }
 
 pub fn pick_upgrade(offer: &Offer, obs: &Observation, state: &WorldState) -> usize {
