@@ -1211,6 +1211,52 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         let dw = dodge.urgency.clamp(0.5, 3.2);
         move_vec[0] += dodge.vec[0] * dw;
         move_vec[1] += dodge.vec[1] * dw;
+    } else if enemies_with_los >= 1
+        && !combat.charging_laser
+        && !zone_urgent
+        && !final_circle
+        && !in_air_hop
+        && state.climb_state.is_none()
+        && cur_roof.is_none()
+        && t >= state.stuck_escape_until
+    {
+        // Opus #3: anti-lead perpendicular micro-juke under gunfire (>45m), rejecting any step that increases exposure!
+        if let Some(pe) = visible_enemies
+            .iter()
+            .filter(|e| e.has_los && e.dist > 45.0)
+            .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            let to_e = (pe.pos[1] - me.pos[1]).atan2(pe.pos[0] - me.pos[0]);
+            let cur_exp = visible_enemies
+                .iter()
+                .filter(|e| map.has_shot_los(e.muzzle, my_upper))
+                .count();
+            for &sgn in &[state.strafe_sign, -state.strafe_sign] {
+                let ang = to_e + sgn * std::f64::consts::FRAC_PI_2;
+                let tx = me.pos[0] + ang.cos() * 4.5;
+                let ty = me.pos[1] + ang.sin() * 4.5;
+                let tz = map.terrain_z(tx, ty);
+                if dist2d([tx, ty], obs.zone.center) < obs.zone.radius - 4.0
+                    && map.terrain_slope_deg(tx, ty) < 44.0
+                    && !map.is_cylinder_blocked(tx, ty, tz, me.radius() + 0.3, me.height(), me.step_up())
+                {
+                    let step_up_pt = [tx, ty, tz + me.height() * 0.78];
+                    let new_exp = visible_enemies
+                        .iter()
+                        .filter(|e| map.has_shot_los(e.muzzle, step_up_pt))
+                        .count();
+                    if new_exp <= cur_exp {
+                        if move_vec[0].hypot(move_vec[1]) < 0.15 {
+                            move_vec = [ang.cos(), ang.sin()];
+                        } else {
+                            move_vec[0] += ang.cos() * 0.65;
+                            move_vec[1] += ang.sin() * 0.65;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     let mlen = move_vec[0].hypot(move_vec[1]);

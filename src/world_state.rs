@@ -920,10 +920,15 @@ impl WorldState {
             self.laser_peek = LaserPeekState::Idle;
         }
 
-        // Strafe rhythm flip
+        // Opus #3: rapid 0.30-0.55s anti-lead micro-juke flips during active LOS gunfire (beats 0.47s gun bullet flight!)
         if t >= self.next_strafe_flip_t {
             self.strafe_sign = -self.strafe_sign;
-            self.next_strafe_flip_t = t + 1.15 + self.next_rand() * 1.05;
+            let in_los = (t - self.last_enemy_los_t) < 0.6;
+            self.next_strafe_flip_t = if in_los {
+                t + 0.30 + self.next_rand() * 0.25
+            } else {
+                t + 1.15 + self.next_rand() * 1.05
+            };
         }
 
         self.prev_pos = obs.me.pos;
