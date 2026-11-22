@@ -870,7 +870,8 @@ pub fn decide_combat(
         if e.last_hit_us_t > t - 3.0 { score += 65.0; }
         if e.charging { score += 60.0; }
         if have_laser.is_some() && e.has_weapon("mortar") { score += 60.0; }
-        if have_light.is_some() && e.has_weapon("laser") && d < light_range + 8.0 { score += 80.0; }
+        if have_light.is_some() && e.has_weapon("laser") && d < light_range + 22.0 { score += 110.0; }
+        if have_laser.is_none() && e.has_weapon("laser") && d < 95.0 { score += 75.0; }
         if have_mortar.is_some() && e.has_weapon("lightning") && d < 90.0 { score += 45.0; }
 
         if let Some(lp) = los_pt {
@@ -910,7 +911,7 @@ pub fn decide_combat(
         let ammo = g.ammo.unwrap_or(12.0);
         let rel = g.reload.unwrap_or(0.0);
         let reload_thresh = if !state.is_ffa() && farm_crate_id.is_none() && farm_npc_id.is_none() { 7.0 } else { 3.0 };
-        if rel <= 0.0 && ammo <= reload_thresh && !any_enemy_has_los && (t - state.last_enemy_los_t) >= 1.1 {
+        if rel <= 0.0 && ammo <= reload_thresh && !any_enemy_has_los && (t - state.last_enemy_los_t) >= 1.0 {
             reload = true;
         }
     }
@@ -980,8 +981,7 @@ pub fn decide_combat(
         }
 
         // Strict LOS-only laser start (validated by 144-match ablation: ground LOS + boost-charge beats blind pre-charging!)
-        // Only skip Laser at point-blank <18m if we actually have Lightning ready (never throw away 315-dmg Laser at 20-44m!)
-        let close_range_speed_trap = d < 18.0
+        let close_range_speed_trap = d < 16.0
             && have_light.is_some()
             && me.energy >= light_energy
             && e.hp > 420.0;
@@ -1230,10 +1230,10 @@ pub fn decide_combat(
                     let cc = [cr.pos[0], cr.pos[1], cr.pos[2] + 1.2];
                     let d = dist3d(my_muzzle, cc);
                     if map.has_shot_los(my_muzzle, cc) && d < 140.0 {
-                        let use_laser_crate = false;
-                        let use_gun = !use_laser_crate && gun_slot.is_some() && gun_ready && d < gun_range;
-                        let use_light = !use_laser_crate && !use_gun && light_slot.is_some() && d < light_range - 1.0 && me.energy > 35.0;
-                        if use_laser_crate || use_gun || use_light {
+                        let use_gun = gun_slot.is_some() && gun_ready && d < gun_range;
+                        let use_light = !use_gun && light_slot.is_some() && d < light_range - 1.0 && me.energy > 35.0;
+                        // Never start charging Laser on crates (prevents P0-1 charged-laser farming lockup & 380m beacon!)
+                        if use_gun || use_light {
                             let c_dx = cc[0] - my_muzzle[0];
                             let c_dy = cc[1] - my_muzzle[1];
                             let c_dz = cc[2] - my_muzzle[2];
@@ -1242,11 +1242,7 @@ pub fn decide_combat(
                             let nxt = slew_one_tick(me.aim, caim, me.turn_rate(), me.pitch_rate(), me.min_pitch(), me.max_pitch());
                             let sdir = aim_dir(nxt[0], nxt[1]);
                             let bclear = map.has_shot_los(my_muzzle, [my_muzzle[0] + sdir[0] * (my_r + 0.5), my_muzzle[1] + sdir[1] * (my_r + 0.5), my_muzzle[2] + sdir[2] * (my_r + 0.5)]);
-                            if use_laser_crate {
-                                if let Some(ls) = laser_slot {
-                                    if bclear && aim_hits_cylinder(nxt, caim, d, 1.4, 2.4) { fire[ls] = true; }
-                                }
-                            } else if use_gun {
+                            if use_gun {
                                 if let Some(gs) = gun_slot {
                                     if bclear && aim_hits_cylinder(nxt, caim, d, 1.4, 2.4) { fire[gs] = true; }
                                 }
