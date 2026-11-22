@@ -852,10 +852,9 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         let laser_cd_cover = have_laser
             && !kill_commit
             && !combat.charging_laser
-            && combat.laser_cd > 0.60
+            && combat.laser_cd > 0.55
             && enemies_with_los >= 1
-            && enemy_laser_ready_soon
-            && (hp_frac < 0.90 || enemies_with_los >= 2);
+            && enemy_laser_ready_soon;
         let want_cover_only = (winning_hp_race
             || need_heal
             || reload_retreat
