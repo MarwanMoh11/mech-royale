@@ -41,7 +41,7 @@ fn is_roof_climbable(
             return false;
         }
         let climb_dh = (ep.pos[2] - ep.drop_z).max(0.0);
-        if climb_dh > max_h || climb_dh > 46.0 {
+        if climb_dh > max_h || climb_dh > 28.0 {
             return false;
         }
         let e_need = (climb_dh / (rise * 0.94)).max(0.5) * me.jet_drain() + 10.0;
@@ -71,10 +71,10 @@ fn target_pos_reachable(
     (pos[2] - obs.me.pos[2]).abs() < 4.0
 }
 
-/// Cube farming cap: 10 cubes (hits stat_cap=10 + 4th upgrade @10 while avoiding 15-cube hitbox bloat!)
+/// Cube farming cap: 15 cubes in Practice (5th upgrade + late supply drops!), 10 in FFA (avoid hitbox bloat!)
 #[inline]
-fn cube_farm_cap(_state: &WorldState) -> i64 {
-    10
+fn cube_farm_cap(state: &WorldState) -> i64 {
+    if state.is_ffa() { 10 } else { 15 }
 }
 
 pub fn pick_upgrade(offer: &Offer, obs: &Observation, state: &WorldState) -> usize {
@@ -775,14 +775,12 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     let mut chosen_hop: Option<RoofHop> = None;
 
     let safe_for_quick_cube = want_more_cubes && hp_frac > 0.65 && !any_enemy_charging && !enemy_lightning_within_52;
-    let close_seen_laser = desired_pickup_is_laser
-        && desired_pickup_pos
-            .map(|p| dist2d([me.pos[0], me.pos[1]], [p[0], p[1]]) < 24.0 && (p[2] - me.pos[2]).abs() < 4.5)
-            .unwrap_or(false);
     let laser_loot_priority = !have_laser
+        && hp_frac > 0.38
+        && enemies_with_los <= 1
+        && !enemy_lightning_within_52
         && desired_pickup_is_laser
-        && desired_pickup_pos.is_some()
-        && (close_seen_laser || (hp_frac > 0.32 && enemies_with_los <= 1 && !enemy_lightning_within_52));
+        && desired_pickup_pos.is_some();
     let kill_drop_laser_search = !have_laser
         && desired_pickup_pos.is_none()
         && hp_frac > 0.42
@@ -1800,30 +1798,6 @@ fn pick_macro_hold_spot(
 
         let mut best_sw: Option<(f64, [f64; 3])> = None;
         let max_r = (nr * 0.72).clamp(30.0, 210.0);
-        // Also evaluate nearby unvisited local street points (65m & 120m from me) so edge spawns sweep local loot first!
-        for &(loc_r, cnt) in &[(65.0, 8usize), (120.0, 8usize)] {
-            for k in 0..cnt {
-                let ang = (k as f64 / cnt as f64) * std::f64::consts::TAU + 0.2;
-                let x = (me.pos[0] + ang.cos() * loc_r).clamp(map.min_x + 12.0, map.max_x - 12.0);
-                let y = (me.pos[1] + ang.sin() * loc_r).clamp(map.min_y + 12.0, map.max_y - 12.0);
-                if !zone_in_stadium && in_stadium_zone(x, y) { continue; }
-                if dist2d([x, y], obs.zone.center) > obs.zone.radius - 14.0 { continue; }
-                if nr > 25.0 && dist2d([x, y], nc) > (nr * 0.96).max(30.0) { continue; }
-                let tz = map.terrain_z(x, y);
-                if map.terrain_slope_deg(x, y) >= 44.0
-                    || map.is_cylinder_blocked(x, y, tz, me.radius() + 0.5, me.height(), me.step_up())
-                {
-                    continue;
-                }
-                let stale = (obs.t - state.sector_visited_t(x, y)).min(120.0);
-                let cov = map.cover_at([x, y]) as f64;
-                let d_nc = dist2d([x, y], nc);
-                let sc = stale * 2.25 + cov * 26.0 - (loc_r - 85.0).abs() * 0.40 - d_nc * 0.05;
-                if best_sw.map(|(bs, _)| sc > bs).unwrap_or(true) {
-                    best_sw = Some((sc, [x, y, tz]));
-                }
-            }
-        }
         for ring in 0..2 {
             let r_f = if ring == 0 { 0.45 } else { 0.85 };
             let sweep_r = (max_r * r_f).max(24.0);
