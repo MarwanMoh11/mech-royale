@@ -101,10 +101,11 @@ pub fn pick_upgrade(offer: &Offer, obs: &Observation, state: &WorldState) -> usi
                 if hp_frac < 0.75 { base + 6.0 } else { base }
             }
             // Zone damage ignores armor -> Plating (+15% max HP + heal) beats Armor (-8% dmg = +8.7% EHP)!
-            "plating" => if is_ffa { 138.0 } else { 128.0 },
+            "plating" => if is_ffa { 138.0 } else { 132.0 },
             "armor" => if is_ffa { 114.0 } else { 116.0 },
             "laser_damage" => if have_laser { if is_ffa { 124.0 } else { 130.0 } } else { 32.0 },
-            "laser_charge" => if have_laser { if is_ffa { 118.0 } else { 125.0 } } else { 32.0 },
+            // Real-server #1 with Laser: -25% charge (0.56s / 0.42s) beats EVERY 0.80s house bot Laser draw!
+            "laser_charge" => if have_laser { if stacks == 0 { 142.0 } else { 134.0 } } else { 32.0 },
             "lightning_range" => if have_light { if is_ffa { 106.0 } else { 110.0 } } else { 28.0 },
             "servos" => if is_ffa { 109.0 } else { 104.0 },
             "lightning_efficiency" => if have_light { if is_ffa { 98.0 } else { 102.0 } } else { 25.0 },
@@ -116,7 +117,16 @@ pub fn pick_upgrade(offer: &Offer, obs: &Observation, state: &WorldState) -> usi
             "gun_rate" => if have_gun { if have_laser { 96.0 } else { 102.0 } } else { 18.0 },
             "gun_damage" => if have_gun { if have_laser { 94.0 } else { 100.0 } } else { 18.0 },
             "gun_velocity" => if have_gun { if have_laser { 76.0 } else { 82.0 } } else { 15.0 },
-            "sensors" => if is_ffa { 96.0 } else { 70.0 },
+            // Real-server Sensors meta: +15m through-tree Laser radar (60m/75m) & +25m vision (225m/250m vs house bots' 200m!)
+            "sensors" => if is_ffa {
+                if stacks == 0 { 112.0 } else { 96.0 }
+            } else if !have_laser {
+                if stacks == 0 { 134.0 } else { 114.0 }
+            } else if stacks == 0 {
+                126.0
+            } else {
+                110.0
+            },
             "gyros" => 76.0,
             "laser_pierce" => if have_laser { if is_ffa { 54.0 } else { 80.0 } } else { 18.0 },
             "mortar_reload" => if have_mortar { 76.0 } else { 15.0 },
@@ -836,7 +846,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         if me.energy > 30.0 { want_boost = true; }
     } else if !visible_enemies.is_empty()
         && (enemies_with_los >= 1
-            || nearest_enemy_d < (if have_laser { 95.0 } else if hp_frac > 0.70 { 28.0 } else { 42.0 })
+            || nearest_enemy_d < (if have_laser { 95.0 } else { 42.0 })
             || (have_laser && cur_roof.is_some() && nearest_enemy_d < 185.0)
             || (have_laser
                 && !state.healing_mode
@@ -850,18 +860,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             && !(have_light && nearest_enemy_d < 46.0)
             && (!is_ffa || hp_frac < 0.65 || enemies_with_los >= 2);
         let gun_only_outnumbered = !is_ffa && !have_laser && !have_light && hp_frac < 0.85 && enemies_within_115 >= 2;
-        let mut flux_dmg_08 = 0.0;
-        let mut flux_ids = [0i64; 8];
-        let mut flux_n = 0usize;
-        for &(dt, bid, amt) in &state.dmg_events {
-            if t - dt <= 0.8 { flux_dmg_08 += amt; }
-            if !flux_ids[..flux_n].contains(&bid) && flux_n < flux_ids.len() {
-                flux_ids[flux_n] = bid;
-                flux_n += 1;
-            }
-        }
-        let heavy_flux = !is_ffa && (flux_n >= 2 || flux_dmg_08 >= me.max_hp * 0.16);
-        let need_heal = state.healing_mode || enemies_with_los >= 2 || heavy_flux;
+        let need_heal = state.healing_mode || enemies_with_los >= 2;
         // Peek-Fire-Hide against ACTUAL Laser holders (denies real Expert bots' 315-dmg Laser during our 1.65s CD!)
         let enemy_laser_ready_soon = visible_enemies
             .iter()
@@ -891,7 +890,8 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             && !combat.charging_laser
             && combat.laser_cd > 0.60
             && enemies_with_los >= 1
-            && enemy_laser_ready_soon;
+            && enemy_laser_ready_soon
+            && (hp_frac < 0.90 || enemies_with_los >= 2);
         let want_cover_only = (winning_hp_race
             || need_heal
             || reload_retreat
@@ -1066,31 +1066,11 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
 
     let stuck_overhang = map.is_covered_above(me.pos[0], me.pos[1], me.pos[2] + me.height() - 0.5, 4.0);
     let on_elevated_non_roof = me.pos[2] > map.terrain_z(me.pos[0], me.pos[1]) + 4.0 && cur_roof.is_none();
-    let stadium_rim_hop = zone_urgent
-        && !in_stadium_zone(obs.zone.next_center[0], obs.zone.next_center[1])
-        && me.pos[0] > -274.0
-        && me.pos[0] < -236.0
-        && me.pos[1] > -12.5
-        && me.pos[1] <= 5.5
-        && me.pos[2] >= 13.0;
-    let stuck_air_ok = stadium_rim_hop
-        || (t < state.stuck_escape_until
-            && !stuck_overhang
-            && (state.stuck_streak < 4 || on_elevated_non_roof)
-            && (enemies_with_los == 0 || !me.in_zone || on_elevated_non_roof));
-    if stadium_rim_hop {
-        let tx = (-255.0 - me.pos[0]).clamp(-6.0, 6.0) * 0.08;
-        let vlen = tx.hypot(1.0);
-        move_vec = [tx / vlen, -1.0 / vlen];
-        if me.pos[2] < 24.5 && me.energy > 8.0 {
-            if me.grounded {
-                want_jump = true;
-                want_boost = false;
-            } else {
-                want_boost = true;
-            }
-        }
-    } else if t < state.stuck_escape_until {
+    let stuck_air_ok = t < state.stuck_escape_until
+        && !stuck_overhang
+        && (state.stuck_streak < 4 || on_elevated_non_roof)
+        && (enemies_with_los == 0 || !me.in_zone || on_elevated_non_roof);
+    if t < state.stuck_escape_until {
         move_vec = state.stuck_escape_dir;
         if stuck_air_ok && me.energy > 14.0 {
             if me.grounded {
@@ -1234,7 +1214,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
     }
 
-    if dodge.urgency >= (if is_ffa { 2.5 } else { 3.0 }) && me.in_zone && !zone_urgent && !in_air_hop {
+    if dodge.urgency >= 3.0 && me.in_zone && !zone_urgent && !in_air_hop {
         // Pure full-speed corner duck / mortar blast evasion — no diagonal drag from tactical goal!
         move_vec = dodge.vec;
     } else if dodge.urgency > 0.1 && !in_air_hop {
@@ -1273,7 +1253,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         && state.climb_state.is_none()
         && state.roof_hop.is_none()
         && !stuck_air_ok
-        && dz_goal <= (if is_ffa { 2.5 } else { 0.3 })
+        && dz_goal <= 0.3
     {
         want_boost = false;
     }
@@ -1338,15 +1318,10 @@ fn find_safe_zone_target(obs: &Observation, map: &ArenaMap, margin_cur: f64) -> 
     // Ohio Stadium horseshoe escape: when zone is outside the Stadium, exit via the open south mouth (-275, 12)
     // or walk south around west wall p[235] via (-395, 48) — eliminates ALL Stadium zone deaths (m24/m25/m29)!
     if !in_stadium_zone(nc[0], nc[1]) {
-        // Tight Stadium bowl + south bleacher p[221] rim hop (excludes east outside corridor x > -222!)
-        if me.pos[0] > -354.0 && me.pos[0] < -222.0 && me.pos[1] > 4.0 && me.pos[1] < 256.0 {
-            let ex = -255.0;
-            let ey = 0.0;
-            return [ex, ey, map.terrain_z(ex, ey)];
-        }
-        if me.pos[0] > -274.0 && me.pos[0] < -236.0 && me.pos[1] > -12.5 && me.pos[1] <= 4.0 && me.pos[2] >= 13.0 {
-            let ex = -255.0;
-            let ey = -24.0;
+        // Inside the Stadium bowl / east bleacher rim
+        if me.pos[0] > -358.0 && me.pos[0] < -174.0 && me.pos[1] > 35.0 && me.pos[1] < 258.0 {
+            let ex = -275.0;
+            let ey = 12.0;
             return [ex, ey, map.terrain_z(ex, ey)];
         }
         // Directly behind west Stadium wall p[235] (x=[-382.2,-352.2], y=[74.3,221.8]) trying to go east
@@ -1428,8 +1403,9 @@ fn pick_tactical_position(
     let zone_in_stadium = in_stadium_zone(obs.zone.next_center[0], obs.zone.next_center[1]);
     let primary_enemy = primary_id.and_then(|pid| enemies.iter().find(|e| e.id == pid));
 
+    let vis_bonus = me.stat("vision_bonus", 0.0);
     let preferred_dist = if have_laser {
-        118.0
+        if vis_bonus >= 45.0 { 212.0 } else if vis_bonus >= 20.0 { 185.0 } else { 118.0 }
     } else {
         76.0
     };

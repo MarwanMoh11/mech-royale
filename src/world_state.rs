@@ -202,7 +202,6 @@ pub struct WorldState {
     pub last_damaged_bearing: Option<f64>,
     pub last_damaged_by: Option<i64>,
     pub last_damaged_rear: bool,
-    pub dmg_events: Vec<(f64, i64, f64)>,
     pub laser_shorted_until: f64,
     pub last_enemy_los_t: f64,
     pub my_laser_charge_start_t: Option<f64>,
@@ -268,7 +267,6 @@ impl WorldState {
             last_damaged_bearing: None,
             last_damaged_by: None,
             last_damaged_rear: false,
-            dmg_events: Vec::new(),
             laser_shorted_until: -10.0,
             last_enemy_los_t: -100.0,
             my_laser_charge_start_t: None,
@@ -357,9 +355,7 @@ impl WorldState {
 
         // 1. Process events
         let mut hit_by_us_ids: Vec<(i64, f64)> = Vec::new();
-        let mut laser_hit_by_ids: Vec<i64> = Vec::new();
         let mut unseen_dmg_mech: Option<(i64, f64)> = None;
-        self.dmg_events.retain(|&(dt, _, _)| t - dt <= 1.5);
         for ev in &obs.events {
             match ev.kind.as_str() {
                 "damaged" => {
@@ -371,10 +367,6 @@ impl WorldState {
                         if let Some(by) = ev.by {
                             self.last_damaged_by = Some(by);
                             if (0..100).contains(&by) {
-                                self.dmg_events.push((t, by, ev.amount.unwrap_or(0.0)));
-                                if ev.weapon.as_deref() == Some("laser") {
-                                    laser_hit_by_ids.push(by);
-                                }
                                 if let Some(tr) = self.enemies.get_mut(&by) {
                                     tr.dmg_dealt_to_us += ev.amount.unwrap_or(0.0);
                                     tr.last_hit_us_t = t;
@@ -591,18 +583,8 @@ impl WorldState {
             }
         }
 
-        // 2b. Apply attributed laser damage cooldown after actor ingestion + ingest obs.beams!
+        // 2b. Ingest obs.beams: update enemy laser cooldown for ALL shooters + exact path[0] muzzle for UNSEEN shooters!
         let enemy_laser_cd = self.config.weapon_f("laser", "cooldown", 1.65);
-        for by in laser_hit_by_ids {
-            if let Some(tr) = self.enemies.get_mut(&by) {
-                tr.laser_ready_t = tr.laser_ready_t.max((t - 0.05).max(0.0) + enemy_laser_cd);
-                tr.charging = false;
-                tr.charge_start_t = None;
-                if !tr.has_weapon("laser") {
-                    tr.weapons.push("laser".to_string());
-                }
-            }
-        }
         for b in &obs.beams {
             if b.by == obs.me.id || !(0..100).contains(&b.by) || b.path.len() < 2 {
                 continue;
@@ -754,15 +736,12 @@ impl WorldState {
         if non_self_deaths > self.prev_non_self_deaths {
             self.prev_non_self_deaths = non_self_deaths;
         }
-        if (non_self_deaths >= 2 && t < 115.0)
-            || (non_self_deaths >= 3 && t < 155.0)
-            || (non_self_deaths >= 1 && t < 75.0 && obs.zone.radius > 300.0)
-        {
+        if (non_self_deaths >= 1 && obs.zone.radius > 110.0) || non_self_deaths >= 2 {
             self.ffa_confirmed = true;
         }
         self.mode = if self.ffa_confirmed {
             MatchMode::Ffa
-        } else if (t >= 25.0 && non_self_deaths == 0) || t >= 115.0 {
+        } else if t >= 25.0 && non_self_deaths == 0 {
             MatchMode::Practice1v15
         } else {
             MatchMode::Unknown
