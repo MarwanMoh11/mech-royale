@@ -837,7 +837,13 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     } else if !visible_enemies.is_empty()
         && (enemies_with_los >= 1
             || nearest_enemy_d < (if have_laser { 95.0 } else { 42.0 })
-            || (have_laser && cur_roof.is_some() && nearest_enemy_d < 185.0))
+            || (have_laser && cur_roof.is_some() && nearest_enemy_d < 185.0)
+            || (have_laser
+                && !state.healing_mode
+                && (combat.laser_cd <= 0.15 || combat.charging_laser)
+                && visible_enemies
+                    .iter()
+                    .any(|e| e.has_laser && (e.laser_ready_t - t) >= 0.85 && e.dist < 175.0)))
     {
         let reload_retreat = combat.gun_reloading
             && !have_laser
@@ -849,6 +855,26 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         let enemy_laser_ready_soon = visible_enemies
             .iter()
             .any(|e| e.has_los && e.has_laser && e.laser_ready_t <= t + 0.85);
+        // Opus #5: Offensive Laser Punish-Window Peek — step out immediately after an enemy wastes its Laser
+        // (e.g. into our wall after bait_charge!) while our Laser is ready and no other Laser holder threatens us!
+        let primary_laser_on_cd = combat
+            .target_enemy_id
+            .and_then(|pid| visible_enemies.iter().find(|e| e.id == pid))
+            .map(|e| e.has_laser && (e.laser_ready_t - t) >= 0.85)
+            .unwrap_or(false);
+        let other_ready_laser_threat = visible_enemies.iter().any(|e| {
+            Some(e.id) != combat.target_enemy_id
+                && e.has_los
+                && e.has_laser
+                && e.laser_ready_t <= t + 0.85
+        });
+        let punish_peek = have_laser
+            && !state.is_laser_shorted(t)
+            && (combat.laser_cd <= 0.15 || combat.charging_laser)
+            && primary_laser_on_cd
+            && !other_ready_laser_threat
+            && !need_heal
+            && enemies_with_los <= 1;
         let laser_cd_cover = have_laser
             && !kill_commit
             && !combat.charging_laser
@@ -864,7 +890,8 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             || (is_ffa && obs.alive > 4 && hp_frac < 0.85 && visible_enemies.iter().all(|e| e.hp > 700.0)))
             && !losing_hp_race
             && !kill_commit
-            && !combat.want_peek;
+            && !combat.want_peek
+            && !punish_peek;
 
         let laser_sweep_target = None;
 
@@ -875,7 +902,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             &visible_enemies,
             combat.target_enemy_id,
             want_cover_only,
-            combat.want_peek || losing_hp_race || kill_commit,
+            combat.want_peek || punish_peek || losing_hp_race || kill_commit,
             cur_roof,
             !want_more_cubes,
             ready_for_rooftops,
@@ -1756,7 +1783,7 @@ fn pick_macro_hold_spot(
                 let d_me = dist2d([me.pos[0], me.pos[1]], [x, y]);
                 let cov = map.cover_at([x, y]) as f64;
                 let mut sc = cov * 115.0 - d_me * 0.35;
-                if d_me < 8.0 && cov >= 0.55 {
+                if d_me < 8.0 && cov >= 0.25 {
                     sc += 24.0; // Hysteresis: hold our dense cover corner instead of jittering!
                 }
                 if state.is_ffa() || me.hp < me.max_hp * 0.78 {
