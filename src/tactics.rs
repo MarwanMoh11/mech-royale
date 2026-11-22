@@ -852,9 +852,10 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         let laser_cd_cover = have_laser
             && !kill_commit
             && !combat.charging_laser
-            && combat.laser_cd > 0.55
+            && combat.laser_cd > 0.60
             && enemies_with_los >= 1
-            && enemy_laser_ready_soon;
+            && enemy_laser_ready_soon
+            && (hp_frac < 0.90 || enemies_with_los >= 2);
         let want_cover_only = (winning_hp_race
             || need_heal
             || reload_retreat
@@ -1362,9 +1363,9 @@ fn pick_tactical_position(
     let primary_enemy = primary_id.and_then(|pid| enemies.iter().find(|e| e.id == pid));
 
     let preferred_dist = if have_laser {
-        118.0
+        if state.is_ffa() { 118.0 } else { 82.0 }
     } else {
-        76.0
+        64.0
     };
 
     let mut candidates: Vec<MoveCandidate> = Vec::with_capacity(48);
