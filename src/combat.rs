@@ -968,30 +968,10 @@ pub fn decide_combat(
             && (gun_ready || (have_light.is_some() && me.energy >= light_energy))
             && e.hp > 420.0;
         let ducking_enemy_laser = dodge.urgency >= 2.5 && dodge.mortar_blast_pos.is_none();
-        // Punish-window pre-charge: when target Laser just fired (cd >= 0.85s) and WE are stepping out of cover into LOS!
-        let my_spd = me.vel[0].hypot(me.vel[1]);
-        let punish_precharge = !has_los
-            && e.visible_now
-            && !e.source_is_beam
-            && !e.source_is_guess
-            && !any_enemy_has_los
-            && !state.healing_mode
-            && e.has_weapon("laser")
-            && (e.laser_ready_t - t) >= 0.85
-            && d >= 38.0
-            && d <= 175.0
-            && my_spd >= 3.0
-            && best_los_point_ex(
-                map,
-                [my_muzzle[0] + me.vel[0] * 0.35, my_muzzle[1] + me.vel[1] * 0.35, my_muzzle[2]],
-                [e.pos[0] + e.vel[0] * 0.35, e.pos[1] + e.vel[1] * 0.35, e.pos[2]],
-                eh,
-                state.is_ffa(),
-            ).is_some();
         let laser_can_start = laser_slot.is_some()
             && allow_shoot
-            && (has_los || punish_precharge)
-            && laser_cd <= dt_sim + 1e-4
+            && has_los
+            && laser_cd <= 2.0 * dt_sim + 1e-4
             && !state.is_laser_shorted(t)
             && d <= laser_range
             && !any_lightning_threat_close
@@ -1104,7 +1084,7 @@ pub fn decide_combat(
             }
         }
 
-        // B4) GUN (Validate strictly on FIRST sim tick + strictly FFA rear-Laser ambush hold for 472-660 dmg snipes!)
+        // B4) GUN (Validate strictly on FIRST sim tick + strictly FFA rear-Laser ambush hold!)
         let yaw_e_to_us_gun = (me.pos[1] - e.pos[1]).atan2(me.pos[0] - e.pos[0]);
         let laser_ambush_feasible = state.is_ffa()
             && (laser_charge > 0.0
@@ -1169,7 +1149,6 @@ pub fn decide_combat(
         .map(|e| target_has_los && dist3d(my_muzzle, e.center(base_h, spc)) < 80.0)
         .unwrap_or(false);
     let in_enemy_fight = laser_charge > 0.0
-        || (state.is_ffa() && (fire[0] || fire[1]))
         || (target_enemy_id.is_some() && (close_active_mech || (!npc_aggro_active && (target_has_los || fire[0] || fire[1]))))
         || (under_unseen_fire && !npc_hit_us_recently)
         || (any_enemy_within_70 && !npc_aggro_active);
@@ -1255,11 +1234,7 @@ pub fn decide_combat(
                 cmd_aim = Some([syaw, -0.02]);
             } else {
                 let max_sound_d = if have_laser.is_some() { 120.0 } else { 55.0 };
-                if let Some(s) = state.sounds.iter().rev().find(|s| {
-                    t - s.t < 1.5
-                        && s.dist_est < max_sound_d
-                        && (!state.is_ffa() || (s.kind != "crate" && s.kind != "npc_gun"))
-                }) {
+                if let Some(s) = state.sounds.iter().rev().find(|s| t - s.t < 1.5 && s.dist_est < max_sound_d) {
                     cmd_aim = Some([s.bearing, 0.0]);
                 }
             }

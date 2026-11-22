@@ -434,7 +434,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         if e.visible_now && e.charging { any_enemy_charging = true; }
         let has_lt = e.has_weapon("lightning");
         let has_ls = e.has_weapon("laser");
-        if has_lt && d < 52.0 && (e.visible_now || t - e.last_seen_t < 1.5) { enemy_lightning_within_52 = true; }
+        if has_lt && d < 60.0 && (e.visible_now || t - e.last_seen_t < 1.5) { enemy_lightning_within_52 = true; }
         if has_ls && los && d < 220.0 { enemy_laser_los_close = true; }
         visible_enemies.push(EnemySummary {
             id: e.id,
@@ -495,7 +495,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     );
     act.take = take_id;
     act.drop = drop_slot;
-    let dropped_only_slot = if take_id.is_none() { drop_slot } else { None };
+    let dropped_only_slot = drop_slot;
 
     // 4. Movement-Only Heal Hysteresis Latch (breaks LOS to heal 56%->88% Prac / 72%->90% FFA,
     //    while NEVER blocking Laser/Gun/Lightning if an enemy actually pushes into LOS!)
@@ -836,7 +836,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         if me.energy > 30.0 { want_boost = true; }
     } else if !visible_enemies.is_empty()
         && (enemies_with_los >= 1
-            || nearest_enemy_d < (if have_laser { 95.0 } else { 42.0 })
+            || nearest_enemy_d < (if have_laser { 95.0 } else if hp_frac > 0.70 { 28.0 } else { 42.0 })
             || (have_laser && cur_roof.is_some() && nearest_enemy_d < 185.0)
             || (have_laser
                 && !state.healing_mode
@@ -850,7 +850,18 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             && !(have_light && nearest_enemy_d < 46.0)
             && (!is_ffa || hp_frac < 0.65 || enemies_with_los >= 2);
         let gun_only_outnumbered = !is_ffa && !have_laser && !have_light && hp_frac < 0.85 && enemies_within_115 >= 2;
-        let need_heal = state.healing_mode || enemies_with_los >= 2;
+        let mut flux_dmg_08 = 0.0;
+        let mut flux_ids = [0i64; 8];
+        let mut flux_n = 0usize;
+        for &(dt, bid, amt) in &state.dmg_events {
+            if t - dt <= 0.8 { flux_dmg_08 += amt; }
+            if !flux_ids[..flux_n].contains(&bid) && flux_n < flux_ids.len() {
+                flux_ids[flux_n] = bid;
+                flux_n += 1;
+            }
+        }
+        let heavy_flux = !is_ffa && (flux_n >= 2 || flux_dmg_08 >= me.max_hp * 0.16);
+        let need_heal = state.healing_mode || enemies_with_los >= 2 || heavy_flux;
         // Peek-Fire-Hide against ACTUAL Laser holders (denies real Expert bots' 315-dmg Laser during our 1.65s CD!)
         let enemy_laser_ready_soon = visible_enemies
             .iter()
@@ -880,8 +891,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             && !combat.charging_laser
             && combat.laser_cd > 0.60
             && enemies_with_los >= 1
-            && enemy_laser_ready_soon
-            && (hp_frac < 0.90 || enemies_with_los >= 2);
+            && enemy_laser_ready_soon;
         let want_cover_only = (winning_hp_race
             || need_heal
             || reload_retreat
@@ -928,7 +938,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
 
         let escaping_lightning = enemy_lightning_within_52 && !have_light;
-        if (enemies_with_los >= 2 || reload_retreat || gun_only_outnumbered || laser_cd_cover || (punish_peek && !combat.target_has_los) || (need_heal && enemies_with_los >= 1) || escaping_lightning)
+        if (enemies_with_los >= 2 || reload_retreat || gun_only_outnumbered || laser_cd_cover || (need_heal && enemies_with_los >= 1) || escaping_lightning)
             && me.energy > 16.0
         {
             want_boost = true;
@@ -1058,14 +1068,12 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     let on_elevated_non_roof = me.pos[2] > map.terrain_z(me.pos[0], me.pos[1]) + 4.0 && cur_roof.is_none();
     let stadium_rim_hop = zone_urgent
         && !in_stadium_zone(obs.zone.next_center[0], obs.zone.next_center[1])
-        && me.pos[0] > -310.0
-        && me.pos[0] < -220.0
+        && me.pos[0] > -274.0
+        && me.pos[0] < -236.0
         && me.pos[1] > -12.5
         && me.pos[1] <= 5.5
         && me.pos[2] >= 13.0;
-    let zone_stuck_jet = !me.in_zone && state.stuck_streak >= 3 && !stuck_overhang;
     let stuck_air_ok = stadium_rim_hop
-        || zone_stuck_jet
         || (t < state.stuck_escape_until
             && !stuck_overhang
             && (state.stuck_streak < 4 || on_elevated_non_roof)
@@ -1081,21 +1089,6 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             } else {
                 want_boost = true;
             }
-        }
-    } else if zone_stuck_jet && t < state.stuck_escape_until {
-        let zx = obs.zone.next_center[0] - me.pos[0];
-        let zy = obs.zone.next_center[1] - me.pos[1];
-        let zd = zx.hypot(zy).max(1e-6);
-        move_vec = [zx / zd, zy / zd];
-        if me.grounded {
-            if me.energy >= 52.0 {
-                want_jump = true;
-                want_boost = false;
-            } else {
-                want_boost = false;
-            }
-        } else {
-            want_boost = me.energy > 6.0;
         }
     } else if t < state.stuck_escape_until {
         move_vec = state.stuck_escape_dir;
@@ -1252,8 +1245,12 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
 
     let mlen = move_vec[0].hypot(move_vec[1]);
     // Boost while charging laser when moving (Opus #1 — matches real Expert 9.75 m/s charge-boost!)
-    if combat.charging_laser && mlen > 0.1 && me.energy > 22.0 && !stealth_walk {
+    let near_final_pin_lock = final_circle && me.in_zone && dist_to_next_center < 5.0;
+    if combat.charging_laser && mlen > 0.1 && me.energy > 22.0 && !stealth_walk && !near_final_pin_lock {
         want_boost = true;
+    }
+    if near_final_pin_lock && me.grounded && dodge.urgency < 2.5 {
+        want_boost = false;
     }
     if mlen > 1e-6 {
         let climbing_asc = state.climb_state.map(|c| c.ascending).unwrap_or(false);
@@ -1338,18 +1335,19 @@ fn find_safe_zone_target(obs: &Observation, map: &ArenaMap, margin_cur: f64) -> 
         }
     }
 
-    // Ohio Stadium rim-hop escape: walk up walkable 26-deg south bleachers to (-255, 0, z=18) then jet +5m over p[221] (top=23.4) to (-255, -24)!
+    // Ohio Stadium horseshoe escape: when zone is outside the Stadium, exit via the open south mouth (-275, 12)
+    // or walk south around west wall p[235] via (-395, 48) — eliminates ALL Stadium zone deaths (m24/m25/m29)!
     if !in_stadium_zone(nc[0], nc[1]) {
-        if me.pos[0] > -364.0 && me.pos[0] < -174.0 && me.pos[1] > -12.0 && me.pos[1] < 260.0 {
-            if me.pos[1] > 4.0 {
-                let ex = -255.0;
-                let ey = 0.0;
-                return [ex, ey, map.terrain_z(ex, ey)];
-            } else {
-                let ex = -255.0;
-                let ey = -24.0;
-                return [ex, ey, map.terrain_z(ex, ey)];
-            }
+        // Tight Stadium bowl + south bleacher p[221] rim hop (excludes east outside corridor x > -222!)
+        if me.pos[0] > -354.0 && me.pos[0] < -222.0 && me.pos[1] > 4.0 && me.pos[1] < 256.0 {
+            let ex = -255.0;
+            let ey = 0.0;
+            return [ex, ey, map.terrain_z(ex, ey)];
+        }
+        if me.pos[0] > -274.0 && me.pos[0] < -236.0 && me.pos[1] > -12.5 && me.pos[1] <= 4.0 && me.pos[2] >= 13.0 {
+            let ex = -255.0;
+            let ey = -24.0;
+            return [ex, ey, map.terrain_z(ex, ey)];
         }
         // Directly behind west Stadium wall p[235] (x=[-382.2,-352.2], y=[74.3,221.8]) trying to go east
         if me.pos[0] >= -430.0 && me.pos[0] <= -355.0 && me.pos[1] > 65.0 && me.pos[1] < 228.0 && nc[0] > -310.0 {
@@ -1684,8 +1682,8 @@ fn pick_tactical_position(
             if on_rooftop && (e.pos[2] - me.pos[2]).abs() < 4.5 && d < 38.0 {
                 enemies_on_my_height += 1;
             }
-            if e.has_lightning && !have_light && d < 52.0 {
-                sc -= (52.0 - d) * 11.5;
+            if e.has_lightning && !have_light && d < 62.0 {
+                sc -= (62.0 - d) * 13.0;
             }
             if map.has_shot_los(e.muzzle, cand_upper) {
                 exposed += 1;
