@@ -20,19 +20,34 @@ fn is_roof_climbable(
     state: &WorldState,
     roof_idx: usize,
     cur_roof: Option<usize>,
+    for_laser_pickup: bool,
 ) -> bool {
     if cur_roof == Some(roof_idx) {
         return true;
     }
-    if obs.t < state.climb_cooldown_until {
-        return false;
+    if !for_laser_pickup || obs.t < state.climb_cooldown_until {
+        return false; // Ground discipline for combat; allow climbing ONLY to grab a seen rooftop Laser!
     }
-    // Pure ground building-cover discipline (validated +1.40 Practice & +0.94 Elite FFA over exposed rooftops!)
-    if cur_roof != Some(roof_idx) {
-        return false;
-    }
-    let _ = (map, obs, state);
-    true
+    let me = &obs.me;
+    let max_h = max_climb_height(me);
+    let rise = me.stat("max_rise_speed", 9.0).max(1.0);
+    let roof = &map.rooftops[roof_idx];
+    roof.edge_pts.iter().any(|ep| {
+        if !ep.launch_clear {
+            return false;
+        }
+        let launch_ground = map.terrain_z(ep.launch_xy[0], ep.launch_xy[1]);
+        if ep.drop_z > launch_ground.max(me.pos[2]) + me.step_up() + 2.0 {
+            return false;
+        }
+        let climb_dh = (ep.pos[2] - ep.drop_z).max(0.0);
+        if climb_dh > max_h || climb_dh > 28.0 {
+            return false;
+        }
+        let e_need = (climb_dh / (rise * 0.94)).max(0.5) * me.jet_drain() + 10.0;
+        e_need <= me.max_energy - 2.0
+            && dist2d(ep.launch_xy, obs.zone.center) <= obs.zone.radius - 4.0
+    })
 }
 
 fn target_pos_reachable(
@@ -51,7 +66,7 @@ fn target_pos_reachable(
         if cur_roof == Some(r_idx) {
             return true;
         }
-        return allow_roof_climb && is_roof_climbable(map, obs, state, r_idx, cur_roof);
+        return allow_roof_climb && is_roof_climbable(map, obs, state, r_idx, cur_roof, allow_roof_climb);
     }
     (pos[2] - obs.me.pos[2]).abs() < 4.0
 }
@@ -769,13 +784,13 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         && desired_pickup_pos.is_some();
     let kill_drop_laser_search = !have_laser
         && desired_pickup_pos.is_none()
-        && hp_frac > 0.45
+        && hp_frac > 0.42
         && enemies_with_los == 0
         && state
             .last_kill_drop_pos
             .map(|(p, kt)| {
                 let d = dist2d([me.pos[0], me.pos[1]], [p[0], p[1]]);
-                t - kt < 18.0 && d > 5.0 && d < 95.0 && dist2d([p[0], p[1]], obs.zone.center) < obs.zone.radius - 6.0
+                t - kt < 28.0 && d > 5.0 && d < 135.0 && dist2d([p[0], p[1]], obs.zone.center) < obs.zone.radius - 6.0
             })
             .unwrap_or(false);
     let urgent_heal_drop = hp_frac < 0.78 && best_drop_pos.is_some() && enemies_with_los == 0;
@@ -817,7 +832,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         if me.energy > 30.0 { want_boost = true; }
     } else if !visible_enemies.is_empty()
         && (enemies_with_los >= 1
-            || nearest_enemy_d < 95.0
+            || nearest_enemy_d < (if have_laser { 95.0 } else { 42.0 })
             || (have_laser && cur_roof.is_some() && nearest_enemy_d < 185.0))
     {
         let reload_retreat = combat.gun_reloading
@@ -826,10 +841,22 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             && (!is_ffa || hp_frac < 0.65 || enemies_with_los >= 2);
         let gun_only_outnumbered = !is_ffa && !have_laser && !have_light && hp_frac < 0.85 && enemies_within_115 >= 2;
         let need_heal = state.healing_mode || enemies_with_los >= 2;
+        // Peek-Fire-Hide against ACTUAL Laser holders (denies real Expert bots' 315-dmg Laser during our 1.65s CD!)
+        let enemy_laser_ready_soon = visible_enemies
+            .iter()
+            .any(|e| e.has_los && e.has_laser && e.laser_ready_t <= t + 0.85);
+        let laser_cd_cover = have_laser
+            && !kill_commit
+            && !combat.charging_laser
+            && combat.laser_cd > 0.60
+            && enemies_with_los >= 1
+            && enemy_laser_ready_soon
+            && (hp_frac < 0.90 || enemies_with_los >= 2);
         let want_cover_only = (winning_hp_race
             || need_heal
             || reload_retreat
             || gun_only_outnumbered
+            || laser_cd_cover
             || (is_ffa && obs.alive > 4 && hp_frac < 0.85 && visible_enemies.iter().all(|e| e.hp > 700.0)))
             && !losing_hp_race
             && !kill_commit
@@ -870,7 +897,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
 
         let escaping_lightning = enemy_lightning_within_52 && !have_light;
-        if (enemies_with_los >= 2 || reload_retreat || gun_only_outnumbered || (need_heal && enemies_with_los >= 1) || escaping_lightning)
+        if (enemies_with_los >= 2 || reload_retreat || gun_only_outnumbered || laser_cd_cover || (need_heal && enemies_with_los >= 1) || escaping_lightning)
             && me.energy > 16.0
         {
             want_boost = true;
@@ -882,6 +909,12 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     } else if kill_drop_laser_search {
         goal_3d = state.last_kill_drop_pos.unwrap().0;
         if me.energy > 35.0 { want_boost = true; }
+    } else if !have_laser && farm_crate_pos.is_some() {
+        // Crack nearby crates aggressively while missing Laser (50% weapon drop + cube #1 instant upgrade!)
+        let cp = farm_crate_pos.unwrap();
+        let d = dist2d([me.pos[0], me.pos[1]], [cp[0], cp[1]]);
+        goal_3d = if d > 12.0 || (cp[2] - me.pos[2]).abs() >= 4.0 { cp } else { me.pos };
+        if d > 18.0 && me.energy > 35.0 { want_boost = true; }
     } else if urgent_heal_drop {
         goal_3d = best_drop_pos.unwrap();
         if dist2d([me.pos[0], me.pos[1]], [goal_3d[0], goal_3d[1]]) > 18.0 && me.energy > 35.0 {
@@ -1465,7 +1498,7 @@ fn pick_tactical_position(
             let max_climb = max_climb_height(me);
             let mut roof_cands: Vec<(f64, [f64; 3])> = Vec::new();
             for (r_idx, roof) in map.rooftops.iter().enumerate() {
-                if !is_roof_climbable(map, obs, state, r_idx, cur_roof) {
+                if !is_roof_climbable(map, obs, state, r_idx, cur_roof, false) {
                     continue;
                 }
                 let mut best_d = f64::INFINITY;
@@ -1634,11 +1667,10 @@ fn pick_tactical_position(
             }
         }
 
-        let height_adv = cand[2] - map.terrain_z(cand[0], cand[1]);
-        sc += height_adv.clamp(0.0, 42.0) * if !state.is_ffa() && have_laser { 2.6 } else { 2.2 };
-        let cur_exposed_now = enemies.iter().filter(|e| e.has_los).count();
-        if on_rooftop && cand[2] < me.pos[2] - 4.0 && enemies_on_my_height < 2 && !(want_cover_only && exposed == 0 && cur_exposed_now >= 2) {
-            sc -= if !state.is_ffa() && have_laser { 115.0 } else { 90.0 };
+        // After grabbing a rooftop Laser, never cling to exposed roofs — drop cleanly back down to ground cover!
+        let _ = enemies_on_my_height;
+        if on_rooftop && cand[2] < me.pos[2] - 4.0 && exposed <= 1 {
+            sc += 55.0;
         }
         if matches!(mc, MoveCandidate::Hop(_)) {
             if enemies_on_my_height >= 1 || want_cover_only {
@@ -1742,7 +1774,7 @@ fn pick_macro_hold_spot(
     }
 
     if let Some(r_idx) = map.rooftop_covering(nc[0], nc[1]) {
-        if is_roof_climbable(map, obs, state, r_idx, cur_roof) {
+        if is_roof_climbable(map, obs, state, r_idx, cur_roof, false) {
             let roof = &map.rooftops[r_idx];
             let top = map.prisms[roof.prism_id].top;
             if !map.is_cylinder_blocked(nc[0], nc[1], top + 0.05, me.radius() + 0.25, me.height(), 0.5) {
@@ -1758,7 +1790,7 @@ fn pick_macro_hold_spot(
     let mut best_score = f64::NEG_INFINITY;
 
     for (r_idx, roof) in map.rooftops.iter().enumerate() {
-        if !is_roof_climbable(map, obs, state, r_idx, cur_roof) {
+        if !is_roof_climbable(map, obs, state, r_idx, cur_roof, false) {
             continue;
         }
         if dist2d([roof.pos[0], roof.pos[1]], obs.zone.center) > obs.zone.radius - 4.0 {

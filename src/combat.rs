@@ -747,6 +747,18 @@ pub fn decide_combat(
         if state.is_ffa() && laser_charge <= 0.0 && obs.alive > 4 && !e.charging && e.last_hit_us_t < t - 4.0 && d > 115.0 && e.hp > e.max_hp * 0.72 && !third_party_kill {
             continue;
         }
+        // Fable #3 (verified on real server stream.jsonl.gz): don't poke distant passive Practice bots that are ignoring us!
+        let yaw_e_to_us_pre = (me.pos[1] - e.pos[1]).atan2(me.pos[0] - e.pos[0]);
+        let passive_distant = !state.is_ffa()
+            && laser_charge <= 0.0
+            && e.last_hit_us_t < t - 5.0
+            && !e.charging
+            && e.hp > e.max_hp * 0.92
+            && d > 115.0
+            && angle_diff(e.aim[0], yaw_e_to_us_pre).abs() > 0.65;
+        if passive_distant && have_laser.is_none() {
+            continue; // Never wake a passive 150m Hard/Expert bot with gun chip while hunting for our Laser!
+        }
 
         let mut score = 0.0;
         if los_pt.is_some() {
@@ -759,6 +771,9 @@ pub fn decide_combat(
         score += (260.0 - d).max(0.0) * 0.55;
         let hp_frac_e = (e.hp / e.max_hp.max(1.0)).clamp(0.0, 1.0);
         score += (1.0 - hp_frac_e) * 165.0;
+        if passive_distant {
+            score -= 120.0; // Finish active hunters first before waking a passive bot!
+        }
         if state.is_ffa() && third_party_kill {
             score += 95.0;
         }
