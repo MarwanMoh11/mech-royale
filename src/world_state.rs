@@ -817,7 +817,7 @@ impl WorldState {
         }
         self.crates.retain(|id, c| {
             if vis_crate_ids.contains(id) { return true; }
-            if t - c.last_seen_t > 18.0 { return false; }
+            if t - c.last_seen_t > 90.0 { return false; }
             !do_evict || !should_be_visible(c.pos, 1.2)
         });
 
@@ -830,7 +830,7 @@ impl WorldState {
         }
         self.cubes.retain(|id, c| {
             if vis_cube_ids.contains(id) { return true; }
-            if t - c.last_seen_t > 15.0 { return false; }
+            if t - c.last_seen_t > 60.0 { return false; }
             !do_evict || !should_be_visible(c.pos, 0.8)
         });
 
