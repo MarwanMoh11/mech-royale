@@ -515,12 +515,17 @@ pub fn compute_dodge(obs: &Observation, state: &WorldState, map: &ArenaMap) -> D
                     if step > max_step + 0.01 { break; }
                     let sp = [me.pos[0] + cx_dir * step, me.pos[1] + cy_dir * step];
                     let mid = [me.pos[0] + cx_dir * (step * 0.5), me.pos[1] + cy_dir * (step * 0.5)];
+                    let sp_z = if cur_roof.is_some() { me.pos[2] } else { map.terrain_z(sp[0], sp[1]) };
+                    let blocks_upper = !map.has_shot_los(em, [sp[0], sp[1], sp_z + my_h * 0.78]);
+                    let blocks_center = !map.has_shot_los(em, [sp[0], sp[1], sp_z + my_h * 0.50]);
                     if side_safe(mid[0], mid[1])
                         && side_safe(sp[0], sp[1])
-                        && map.has_shot_los(my_waist, [sp[0], sp[1], me.pos[2] + 3.0])
-                        && !map.has_shot_los(em, [sp[0], sp[1], me.pos[2] + my_h * 0.78])
+                        && map.has_shot_los(my_waist, [sp[0], sp[1], sp_z + 3.0])
+                        && (blocks_upper || blocks_center)
                     {
-                        let cost = step + if off.abs() < 1.0 { 1.8 } else { 0.0 };
+                        let cost = step
+                            + if off.abs() < 1.0 { 1.8 } else { 0.0 }
+                            + if !blocks_upper { 1.2 } else { 0.0 };
                         if best_duck.map(|(bc, _, _)| cost < bc).unwrap_or(true) {
                             best_duck = Some((cost, cx_dir, cy_dir));
                         }
@@ -868,17 +873,7 @@ pub fn decide_combat(
     if let Some(g) = have_gun {
         let ammo = g.ammo.unwrap_or(12.0);
         let rel = g.reload.unwrap_or(0.0);
-        let rel_thresh = if !state.is_ffa() && farm_crate_id.is_none() && farm_npc_id.is_none() {
-            7.0
-        } else {
-            3.0
-        };
-        let rel_delay = if !state.is_ffa() && farm_crate_id.is_none() && farm_npc_id.is_none() {
-            1.2
-        } else {
-            1.0
-        };
-        if rel <= 0.0 && ammo <= rel_thresh && !any_enemy_has_los && (t - state.last_enemy_los_t) >= rel_delay {
+        if rel <= 0.0 && ammo <= 3.0 && !any_enemy_has_los && (t - state.last_enemy_los_t) >= 1.0 {
             reload = true;
         }
     }
