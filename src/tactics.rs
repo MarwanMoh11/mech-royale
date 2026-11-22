@@ -590,17 +590,11 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
     }
 
-    // Regen hygiene (Opus #4) + Cover Fortress discipline (once have_laser, stop leaving cover for distant crates/NPCs!)
+    // Regen hygiene (Opus #4): don't shoot crates while hurt (<90% HP) unless we still lack Laser/2nd weapon!
     let crate_regen_ok = hp_frac >= 0.90 || missing_second_weapon || !have_laser;
     if me.in_zone && enemies_with_los == 0 && nearest_enemy_d > 55.0 && (want_more_cubes || missing_second_weapon || !have_laser) {
         if crate_regen_ok {
-            let crate_max_d = if !have_laser || missing_second_weapon {
-                135.0
-            } else if me.cubes < 6 {
-                50.0
-            } else {
-                32.0
-            };
+            let crate_max_d = if me.cubes < 6 || missing_second_weapon || !have_laser { 135.0 } else { 80.0 };
             let mut best_c_score = f64::NEG_INFINITY;
             for c in state.crates.values() {
                 let d = dist2d([me.pos[0], me.pos[1]], [c.pos[0], c.pos[1]]);
@@ -615,9 +609,8 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
                 }
             }
         }
-        // Once armed with Laser, never wander 115m out of cover to farm passive NPC drones (costs HP/regen + 320m beacon!)
-        if farm_npc_id.is_none() && want_more_cubes && hp_frac > 0.78 && !state.healing_mode {
-            let mut best_nd = if !have_laser { 95.0 } else { 42.0 };
+        if farm_npc_id.is_none() && want_more_cubes && hp_frac > 0.72 && !state.healing_mode {
+            let mut best_nd = if me.cubes < 10 { 115.0 } else { 85.0 };
             for n in state.npcs.values() {
                 let d = dist2d([me.pos[0], me.pos[1]], [n.pos[0], n.pos[1]]);
                 if d < best_nd && dist2d([n.pos[0], n.pos[1]], obs.zone.center) < obs.zone.radius - 10.0 {
@@ -672,16 +665,10 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         state.zone_boost_active = false;
     }
 
-    // Best nearby cube (up to CUBE_FARM_CAP — stay near cover fortress once armed with Laser!)
+    // Best nearby cube (up to CUBE_FARM_CAP!)
     let mut best_cube_pos: Option<[f64; 3]> = None;
     if want_more_cubes {
-        let mut best_d = if enemies_with_los == 0 {
-            if have_laser { 52.0 } else { 115.0 }
-        } else if enemies_with_los == 1 && hp_frac > 0.65 {
-            26.0
-        } else {
-            12.0
-        };
+        let mut best_d = if enemies_with_los == 0 { 115.0 } else if enemies_with_los == 1 && hp_frac > 0.65 { 26.0 } else { 12.0 };
         for cb in state.cubes.values() {
             let d = dist2d([me.pos[0], me.pos[1]], [cb.pos[0], cb.pos[1]]);
             if d < best_d
@@ -694,11 +681,10 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
     }
 
-    // Supply drops: pick CLOSEST reachable drop (when healthy + armed, only contest nearby <110m drops!)
+    // Supply drops: pick CLOSEST reachable drop (full HP + full energy + 3 cubes = ~31s regen! Opus #4 + Fable #4)
     let mut best_drop_pos: Option<[f64; 3]> = None;
     let mut best_drop_eta = f64::INFINITY;
     let mut finishing_drop_pos: Option<[f64; 3]> = None;
-    let max_drop_seek = if !have_laser || hp_frac < 0.78 { 210.0 } else { 110.0 };
     for dr in &obs.drops {
         let d = dist2d([me.pos[0], me.pos[1]], [dr.pos[0], dr.pos[1]]);
         if dist2d([dr.pos[0], dr.pos[1]], obs.zone.center) > obs.zone.radius - 6.0 {
@@ -709,7 +695,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
         let eta = d / me.walk_speed().max(8.0);
         let ready_to_cap = dr.lands_in <= eta + 12.0;
-        if ready_to_cap && d < max_drop_seek && enemies_with_los <= 1 && (want_more_cubes || hp_frac < 0.78) {
+        if ready_to_cap && d < 210.0 && enemies_with_los <= 1 && (want_more_cubes || hp_frac < 0.78) {
             if !is_ffa || hp_frac < 0.78 || dr.holder.is_none() || dr.holder == Some(me.id) {
                 let score_eta = eta.max(dr.lands_in);
                 if score_eta < best_drop_eta {
@@ -1769,9 +1755,9 @@ fn pick_macro_hold_spot(
                 }
                 let d_me = dist2d([me.pos[0], me.pos[1]], [x, y]);
                 let cov = map.cover_at([x, y]) as f64;
-                let mut sc = cov * 135.0 - d_me * 0.35;
-                if d_me < 8.0 && cov >= 0.28 {
-                    sc += 28.0; // Hysteresis: hold our dense cover corner instead of jittering!
+                let mut sc = cov * 115.0 - d_me * 0.35;
+                if d_me < 8.0 && cov >= 0.25 {
+                    sc += 24.0; // Hysteresis: hold our dense cover corner instead of jittering!
                 }
                 if state.is_ffa() || me.hp < me.max_hp * 0.78 {
                     for s in &state.sounds {
@@ -1784,9 +1770,9 @@ fn pick_macro_hold_spot(
                     best_hold = Some((sc, [x, y, tz]));
                 }
             };
-            // Always evaluate current position + tight local dense building corners + inner next_zone rings
+            // Always evaluate current position + local dense building corners + inner next_zone rings
             eval_spot(me.pos[0], me.pos[1]);
-            for &(loc_r, cnt) in &[(10.0, 10usize), (22.0, 10usize), (36.0, 8usize)] {
+            for &(loc_r, cnt) in &[(16.0, 8usize), (34.0, 8usize)] {
                 for k in 0..cnt {
                     let ang = (k as f64 / cnt as f64) * std::f64::consts::TAU;
                     let x = (me.pos[0] + ang.cos() * loc_r).clamp(map.min_x + 12.0, map.max_x - 12.0);

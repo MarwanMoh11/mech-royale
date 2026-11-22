@@ -1058,9 +1058,18 @@ pub fn decide_combat(
             }
         }
 
-        // B4) GUN (Validate strictly on the FIRST sim tick that will consume the held trigger! Fixes P0-2)
+        // B4) GUN (Validate strictly on the FIRST sim tick + Opus B2: never wake unaware >70° rear enemy with 45-dmg gun before 472-dmg rear Laser!)
+        let yaw_e_to_us_gun = (me.pos[1] - e.pos[1]).atan2(me.pos[0] - e.pos[0]);
+        let hold_gun_for_rear_laser = have_laser.is_some()
+            && !state.is_laser_shorted(t)
+            && d <= laser_range
+            && (laser_charge > 0.0 || laser_cd <= 0.55)
+            && !e.charging
+            && e.last_hit_us_t < t - 4.0
+            && e.hp > 180.0
+            && angle_diff(e.aim[0], yaw_e_to_us_gun).abs() > 1.22;
         if let Some(gs) = gun_slot {
-            if allow_shoot && has_los && d <= gun_range && !mortar_owns_aim {
+            if allow_shoot && has_los && d <= gun_range && !mortar_owns_aim && !hold_gun_for_rear_laser {
                 if gun_fires_t1 && barrel_clear_t1 {
                     let hit1 = aim_hits_cylinder(aim_t1, desired_gun_aim, d, (er + 0.3) * 1.05, eh * 0.96);
                     let hit_dir = d < 32.0 && aim_hits_cylinder(aim_t1, hitscan_aim, d, (er + 0.3) * 1.05, eh * 0.96);
