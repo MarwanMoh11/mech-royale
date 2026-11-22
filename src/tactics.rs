@@ -106,13 +106,13 @@ pub fn pick_upgrade(offer: &Offer, obs: &Observation, state: &WorldState) -> usi
             "armor" => if is_ffa { 114.0 } else { 122.0 },
             "laser_damage" => if have_laser { if is_ffa { 122.0 } else { 128.0 } } else { 32.0 },
             "laser_charge" => if have_laser { if is_ffa { 108.0 } else { 114.0 } } else { 32.0 },
-            "lightning_range" => if have_light { if is_ffa { 106.0 } else { 110.0 } } else { 28.0 },
+            "lightning_range" => if have_light { if is_ffa { 112.0 } else { 126.0 } } else { 28.0 },
             "servos" => if is_ffa { 109.0 } else { 104.0 },
-            "lightning_efficiency" => if have_light { if is_ffa { 98.0 } else { 102.0 } } else { 25.0 },
+            "lightning_efficiency" => if have_light { if is_ffa { 104.0 } else { 118.0 } } else { 25.0 },
             "jets" => if stacks == 0 { if is_ffa { 92.0 } else { 96.0 } } else { 80.0 },
-            "lightning_chain" => if have_light { if is_ffa { 62.0 } else { 96.0 } } else { 20.0 },
-            "reactor" => if is_ffa { 88.0 } else { 91.0 },
-            "capacitor" => if is_ffa { 82.0 } else { 86.0 },
+            "lightning_chain" => if have_light { if is_ffa { 68.0 } else { 124.0 } } else { 20.0 },
+            "reactor" => if have_light { 108.0 } else if is_ffa { 88.0 } else { 91.0 },
+            "capacitor" => if have_light { 100.0 } else if is_ffa { 82.0 } else { 86.0 },
             "gun_mag" => if have_gun { if have_laser { 100.0 } else { 106.0 } } else { 18.0 },
             "gun_rate" => if have_gun { if have_laser { 96.0 } else { 102.0 } } else { 18.0 },
             "gun_damage" => if have_gun { if have_laser { 94.0 } else { 100.0 } } else { 18.0 },
@@ -190,10 +190,12 @@ pub fn decide_weapon_pickup(
         let w0 = s0.unwrap();
         let w1 = s1.unwrap();
 
-        // Always upgrade to Laser if missing! (Keep Gun or Lightning alongside Laser)
+        // Always upgrade to Laser if missing! In Practice keep Lightning alongside Laser (Laser+Lightning corner doctrine!); in FFA keep Gun until late circle.
         if kind == "laser" {
             let drop_slot = if w1.kind == "mortar" { 1 }
                 else if w0.kind == "mortar" { 0 }
+                else if !state.is_ffa() && w0.kind == "gun" && w1.kind == "lightning" { 0 }
+                else if !state.is_ffa() && w1.kind == "gun" && w0.kind == "lightning" { 1 }
                 else if w1.kind != "gun" { 1 }
                 else { 0 };
             return Some((180.0, Some(drop_slot)));
@@ -205,13 +207,19 @@ pub fn decide_weapon_pickup(
             return Some((135.0, Some(m_slot)));
         }
 
-        // Late-game close quarters (next_radius <= 70 or radius <= 85): swap Gun -> Lightning! (Opus #7 — drops broken energy_ups gate!)
+        // Practice: First-class Laser + Lightning (Fable #3: 240-524 DPS auto-hit + 2s laser shorting!).
+        // FFA: Keep Gun + Laser until close quarters (next_radius <= 70 or radius <= 85).
         if kind == "lightning" && already_has("laser") && already_has("gun") {
             let mid_gunfight = enemies_with_los >= 1 && nearest_enemy_d > 48.0;
-            let close_endgame = obs.zone.next_radius <= 70.0 || obs.zone.radius <= 85.0;
-            if !mid_gunfight && close_endgame && gun_ups <= 2 {
+            let want_swap = if !state.is_ffa() {
+                !mid_gunfight && gun_ups <= 1
+            } else {
+                let close_endgame = obs.zone.next_radius <= 70.0 || obs.zone.radius <= 85.0;
+                !mid_gunfight && close_endgame && gun_ups <= 2
+            };
+            if want_swap {
                 let gun_slot = if w0.kind == "gun" { 0 } else { 1 };
-                return Some((130.0, Some(gun_slot)));
+                return Some((148.0, Some(gun_slot)));
             }
         }
         None
@@ -252,7 +260,7 @@ pub fn decide_weapon_pickup(
         if let Some((val, _)) = evaluate_kind(&p.kind) {
             let d = dist2d([me.pos[0], me.pos[1]], [p.pos[0], p.pos[1]]);
             let is_laser = p.kind == "laser";
-            let max_seek = if is_laser { 450.0 } else { 115.0 };
+            let max_seek = if is_laser { 450.0 } else if p.kind == "lightning" && !state.is_ffa() { 165.0 } else { 115.0 };
             if d > max_seek { continue; }
             if dist2d([p.pos[0], p.pos[1]], obs.zone.center) > obs.zone.radius - 5.0 { continue; }
             let allow_roof = ready_for_rooftops || is_laser;
@@ -841,65 +849,65 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             && (!is_ffa || hp_frac < 0.65 || enemies_with_los >= 2);
         let gun_only_outnumbered = !is_ffa && !have_laser && !have_light && hp_frac < 0.85 && enemies_within_115 >= 2;
         let need_heal = state.healing_mode || enemies_with_los >= 2;
-        // Peek-Fire-Hide against ACTUAL Laser holders EVEN at 100% HP (denies real Expert bots' 315-dmg Laser during our 1.65s CD!)
+        // Peek-Fire-Hide against ACTUAL Laser holders (denies real Expert bots' 315-dmg Laser during our 1.65s CD!)
         let enemy_laser_ready_soon = visible_enemies
             .iter()
             .any(|e| e.has_los && e.has_laser && e.laser_ready_t <= t + 0.85);
         let laser_cd_cover = have_laser
             && !kill_commit
             && !combat.charging_laser
-            && combat.laser_cd > 0.55
+            && combat.laser_cd > 0.60
             && enemies_with_los >= 1
-            && enemy_laser_ready_soon;
+            && enemy_laser_ready_soon
+            && (hp_frac < 0.90 || enemies_with_los >= 2);
+        let low_energy_recharge = have_light
+            && !have_gun
+            && me.energy < 18.0
+            && combat.laser_cd > 0.30
+            && !combat.charging_laser
+            && enemies_with_los >= 1;
         let want_cover_only = (winning_hp_race
             || need_heal
             || reload_retreat
             || gun_only_outnumbered
             || laser_cd_cover
+            || low_energy_recharge
             || (is_ffa && obs.alive > 4 && hp_frac < 0.85 && visible_enemies.iter().all(|e| e.hp > 700.0)))
             && !losing_hp_race
             && !kill_commit
             && !combat.want_peek;
 
-        if let Some(pg) = combat.peek_goal {
-            goal_3d = pg;
-            state.last_tactical_goal = Some(pg);
-            if me.energy > 20.0 {
-                want_boost = true;
-            }
-        } else {
-            let laser_sweep_target = None;
+        let laser_sweep_target = None;
 
-            let chosen = pick_tactical_position(
-                obs,
-                state,
-                map,
-                &visible_enemies,
-                combat.target_enemy_id,
-                want_cover_only,
-                combat.want_peek || losing_hp_race || kill_commit,
-                cur_roof,
-                !want_more_cubes,
-                ready_for_rooftops,
-                laser_sweep_target,
-            );
-            match chosen {
-                MoveCandidate::Pos(p) => {
-                    goal_3d = p;
-                    state.last_tactical_goal = Some(p);
-                }
-                MoveCandidate::Hop(h) => {
-                    chosen_hop = Some(h);
-                    goal_3d = h.from_pos;
-                    state.roof_hop = Some(RoofHopState {
-                        from_pos: h.from_pos,
-                        to_pos: h.to_pos,
-                        to_roof_idx: h.to_roof_idx,
-                        min_energy: h.min_energy,
-                        phase: 0,
-                        started_t: t,
-                    });
-                }
+        let chosen = pick_tactical_position(
+            obs,
+            state,
+            map,
+            &visible_enemies,
+            combat.target_enemy_id,
+            want_cover_only,
+            combat.want_peek || losing_hp_race || kill_commit,
+            cur_roof,
+            !want_more_cubes,
+            ready_for_rooftops,
+            laser_sweep_target,
+        );
+        match chosen {
+            MoveCandidate::Pos(p) => {
+                goal_3d = p;
+                state.last_tactical_goal = Some(p);
+            }
+            MoveCandidate::Hop(h) => {
+                chosen_hop = Some(h);
+                goal_3d = h.from_pos;
+                state.roof_hop = Some(RoofHopState {
+                    from_pos: h.from_pos,
+                    to_pos: h.to_pos,
+                    to_roof_idx: h.to_roof_idx,
+                    min_energy: h.min_energy,
+                    phase: 0,
+                    started_t: t,
+                });
             }
         }
 
@@ -1362,7 +1370,10 @@ fn pick_tactical_position(
     let zone_in_stadium = in_stadium_zone(obs.zone.next_center[0], obs.zone.next_center[1]);
     let primary_enemy = primary_id.and_then(|pid| enemies.iter().find(|e| e.id == pid));
 
-    let preferred_dist = if have_laser {
+    let have_gun = find_weapon_slot(me, "gun").is_some();
+    let preferred_dist = if have_laser && have_light && !have_gun {
+        if me.energy >= 24.0 { 38.0 } else { 95.0 }
+    } else if have_laser {
         118.0
     } else if have_light {
         34.0
