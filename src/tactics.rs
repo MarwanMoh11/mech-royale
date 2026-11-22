@@ -503,12 +503,12 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     let heal_enter = if is_ffa {
         if nanites >= 1 { 0.74 } else { 0.68 }
     } else {
-        if nanites >= 1 { 0.52 } else { 0.46 }
+        if nanites >= 1 { 0.60 } else { 0.54 }
     };
     let heal_exit = if is_ffa {
         if nanites >= 1 { 0.92 } else { 0.86 }
     } else {
-        if nanites >= 1 { 0.86 } else { 0.80 }
+        if nanites >= 1 { 0.88 } else { 0.82 }
     };
 
     // Dynamic endgame timing derived from live zone phases (Opus #8 + GPT-6.2 P0-4)
@@ -844,13 +844,13 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     } else if best_drop_pos.is_some()
         && enemies_with_los == 0
         && (hp_frac < 0.74 || me.cubes < 12)
-        && best_drop_pos.map(|dp| dist2d([me.pos[0], me.pos[1]], [dp[0], dp[1]]) < 155.0).unwrap_or(false)
+        && best_drop_pos.map(|dp| dist2d([me.pos[0], me.pos[1]], [dp[0], dp[1]]) < 145.0).unwrap_or(false)
     {
         goal_3d = best_drop_pos.unwrap();
         if me.energy > 28.0 { want_boost = true; }
     } else if !visible_enemies.is_empty()
         && (enemies_with_los >= 1
-            || nearest_enemy_d < (if have_laser { if !is_ffa && hp_frac > 0.62 { 185.0 } else { 95.0 } } else { 42.0 })
+            || nearest_enemy_d < (if have_laser { 95.0 } else { 42.0 })
             || (have_laser && cur_roof.is_some() && nearest_enemy_d < 185.0)
             || (have_laser
                 && !state.healing_mode
@@ -1046,9 +1046,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         if !have_laser && me.energy > 20.0 {
             want_boost = true;
         }
-        if have_laser && !is_ffa && hp_frac > 0.72 && t < 210.0 && dist2d([me.pos[0], me.pos[1]], [goal_3d[0], goal_3d[1]]) > 20.0 && me.energy > 38.0 {
-            want_boost = true;
-        } else if have_laser && dist2d([me.pos[0], me.pos[1]], [goal_3d[0], goal_3d[1]]) < 12.0 {
+        if have_laser && dist2d([me.pos[0], me.pos[1]], [goal_3d[0], goal_3d[1]]) < 12.0 {
             stealth_walk = true;
             want_boost = false;
         }
@@ -1829,6 +1827,16 @@ fn pick_tactical_position(
                     if !map.has_shot_los(pe.muzzle, cand_center) {
                         sc += 135.0;
                     }
+                    // PROTOCOL §8 TREE-SCREEN ONE-WAY SNIPER: past 50m, dense trees block enemy vision (center & top) while letting OUR 315-dmg Laser shoot straight through!
+                    // Fast short-circuit: only test top ray if center ray is blocked by trees (and reuse solid LOS!).
+                    if primary_dist > 50.0 && primary_dist < 195.0 && (sc + 260.0 > best_score) {
+                        let pe_eye = [pe.pos[0], pe.pos[1], pe.pos[2] + 8.0];
+                        let cand_top = [cand[0], cand[1], cand[2] + my_h];
+                        let mid_vis_blocked = map.trees_block_vision(pe_eye, cand_center) || !map.has_shot_los(pe_eye, cand_center);
+                        if mid_vis_blocked && (map.trees_block_vision(pe_eye, cand_top) || !map.has_shot_los(pe_eye, cand_top)) {
+                            sc += 165.0;
+                        }
+                    }
                 }
             } else if exposed == 0 {
                 sc += if want_peek { 35.0 } else { 110.0 };
@@ -1927,64 +1935,6 @@ fn pick_macro_hold_spot(
     // Phase B (have_laser): HOLD a dense building-cover corner inside next_zone instead of patrolling open streets! (Fable #4)
     if !ready_for_rooftops {
         let have_laser = find_weapon_slot(me, "laser").is_some();
-        if have_laser && !state.is_ffa() && me.hp > me.max_hp * 0.72 && obs.t < 210.0 {
-            // ACTIVE HUNTER: move toward nearest fresh weapon sound (or unvisited dense-cover avenue inside next_zone) to farm isolated 1v1 kills FAST before late swarm!
-            let mut best_sound: Option<(f64, [f64; 3])> = None;
-            for s in &state.sounds {
-                if obs.t - s.t < 2.2 && matches!(s.kind.as_str(), "gun" | "laser" | "mortar" | "lightning" | "crate") {
-                    let sx = s.est_pos[0].clamp(map.min_x + 14.0, map.max_x - 14.0);
-                    let sy = s.est_pos[1].clamp(map.min_y + 14.0, map.max_y - 14.0);
-                    if (!zone_in_stadium && in_stadium_zone(sx, sy))
-                        || dist2d([sx, sy], obs.zone.center) > obs.zone.radius - 14.0
-                        || (nr > 20.0 && dist2d([sx, sy], nc) > nr - 8.0)
-                    {
-                        continue;
-                    }
-                    let tz = map.terrain_z(sx, sy);
-                    if map.terrain_slope_deg(sx, sy) < 44.0
-                        && !map.is_cylinder_blocked(sx, sy, tz, me.radius() + 0.5, me.height(), me.step_up())
-                    {
-                        let d = dist2d([me.pos[0], me.pos[1]], [sx, sy]);
-                        if d > 25.0 && d < 220.0 && best_sound.map(|(bd, _)| d < bd).unwrap_or(true) {
-                            best_sound = Some((d, [sx, sy, tz]));
-                        }
-                    }
-                }
-            }
-            if let Some((_, sp)) = best_sound {
-                return sp;
-            }
-            // No fresh sound: patrol unvisited high-cover streets inside next_zone to find isolated Easy/Medium bots!
-            let mut best_hunt: Option<(f64, [f64; 3])> = None;
-            for &(lr, cnt) in &[(75.0, 8usize), (145.0, 8usize)] {
-                for k in 0..cnt {
-                    let ang = (k as f64 / cnt as f64) * std::f64::consts::TAU;
-                    let x = (me.pos[0] + ang.cos() * lr).clamp(map.min_x + 14.0, map.max_x - 14.0);
-                    let y = (me.pos[1] + ang.sin() * lr).clamp(map.min_y + 14.0, map.max_y - 14.0);
-                    if (!zone_in_stadium && in_stadium_zone(x, y))
-                        || dist2d([x, y], obs.zone.center) > obs.zone.radius - 12.0
-                        || (nr > 20.0 && dist2d([x, y], nc) > nr - 8.0)
-                    {
-                        continue;
-                    }
-                    let tz = map.terrain_z(x, y);
-                    if map.terrain_slope_deg(x, y) >= 44.0
-                        || map.is_cylinder_blocked(x, y, tz, me.radius() + 0.5, me.height(), me.step_up())
-                    {
-                        continue;
-                    }
-                    let stale = (obs.t - state.sector_visited_t(x, y)).min(120.0);
-                    let cov = map.cover_at([x, y]) as f64;
-                    let sc = stale * 2.0 + cov * 75.0 - dist2d([x, y], nc) * 0.25;
-                    if best_hunt.map(|(bs, _)| sc > bs).unwrap_or(true) {
-                        best_hunt = Some((sc, [x, y, tz]));
-                    }
-                }
-            }
-            if let Some((_, hp)) = best_hunt {
-                return hp;
-            }
-        }
         if have_laser {
             let mut best_hold: Option<(f64, [f64; 3])> = None;
             let hold_max_r = (nr * 0.68).clamp(18.0, 155.0);
