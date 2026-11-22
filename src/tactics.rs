@@ -452,29 +452,48 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         });
     }
 
-    if (t - state.last_damaged_t) < 2.0 {
+    let mut tree_blind_fire = false;
+    if (t - state.last_damaged_t) < 2.2 {
         if let (Some(by), Some(bear)) = (state.last_damaged_by, state.last_damaged_bearing) {
-            if (0..100).contains(&by) && !visible_enemies.iter().any(|e| e.id == by) {
-                let gx = me.pos[0] + bear.cos() * 75.0;
-                let gy = me.pos[1] + bear.sin() * 75.0;
+            let attacker_visible = state.enemies.get(&by).map(|e| e.visible_now).unwrap_or(false);
+            if (0..100).contains(&by) && !attacker_visible {
+                // If we already face roughly toward the attacker and still cannot see them -> tree-occluded or >200m!
+                if angle_diff(me.aim[0], bear).abs() < 0.85 {
+                    tree_blind_fire = true;
+                }
+                let bdir = [bear.cos(), bear.sin(), 0.0];
+                let clear_d = map
+                    .raycast_solid(my_muzzle, bdir, 165.0)
+                    .map(|h| (h.t - 4.0).clamp(35.0, 155.0))
+                    .unwrap_or(135.0);
+                let gx = (me.pos[0] + bear.cos() * clear_d).clamp(map.min_x + 6.0, map.max_x - 6.0);
+                let gy = (me.pos[1] + bear.sin() * clear_d).clamp(map.min_y + 6.0, map.max_y - 6.0);
                 let gz = map.terrain_z(gx, gy);
-                visible_enemies.push(EnemySummary {
-                    id: by,
-                    pos: [gx, gy, gz],
-                    muzzle: [gx, gy, gz + 7.0],
-                    center: [gx, gy, gz + 4.5],
-                    dist: 75.0,
-                    has_los: true,
-                    hp: 1200.0,
-                    max_hp: 1400.0,
-                    charging: false,
-                    has_lightning: false,
-                    has_laser: false,
-                    laser_ready_t: -10.0,
-                });
-                enemies_with_los += 1;
-                enemies_within_115 += 1;
-                nearest_enemy_d = nearest_enemy_d.min(75.0);
+                if let Some(es) = visible_enemies.iter_mut().find(|e| e.id == by) {
+                    es.pos = [gx, gy, gz];
+                    es.muzzle = [gx, gy, gz + 7.0];
+                    es.center = [gx, gy, gz + 4.5];
+                    es.dist = clear_d;
+                    es.has_los = true;
+                } else {
+                    visible_enemies.push(EnemySummary {
+                        id: by,
+                        pos: [gx, gy, gz],
+                        muzzle: [gx, gy, gz + 7.0],
+                        center: [gx, gy, gz + 4.5],
+                        dist: clear_d,
+                        has_los: true,
+                        hp: 1200.0,
+                        max_hp: 1400.0,
+                        charging: false,
+                        has_lightning: false,
+                        has_laser: true,
+                        laser_ready_t: -10.0,
+                    });
+                    enemies_with_los += 1;
+                    enemies_within_115 += 1;
+                    nearest_enemy_d = nearest_enemy_d.min(clear_d);
+                }
             }
         }
     }
@@ -884,6 +903,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             && enemy_laser_ready_soon;
         let want_cover_only = (winning_hp_race
             || need_heal
+            || tree_blind_fire
             || reload_retreat
             || gun_only_outnumbered
             || laser_cd_cover
@@ -973,7 +993,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
                 }
             }
         }
-        if (enemies_with_los >= 2 || reload_retreat || gun_only_outnumbered || laser_cd_cover || (need_heal && enemies_with_los >= 1) || escaping_lightning)
+        if (enemies_with_los >= 2 || tree_blind_fire || reload_retreat || gun_only_outnumbered || laser_cd_cover || (need_heal && enemies_with_los >= 1) || escaping_lightning)
             && me.energy > 16.0
         {
             want_boost = true;
@@ -1252,6 +1272,23 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             let rep = map.wall_repulsion(me.pos[0], me.pos[1], me.pos[2], me.radius() + 1.1, me.height(), me.step_up());
             move_vec[0] += rep[0] * 0.7;
             move_vec[1] += rep[1] * 0.7;
+        }
+    } else if enemies_with_los >= 1 && !zone_urgent && !final_circle && dodge.urgency < 0.2 {
+        // Never stand dead still at 0 m/s in open LOS! Micro-strafe perpendicular to primary threat!
+        if let Some(pe) = combat.target_enemy_id.and_then(|pid| visible_enemies.iter().find(|e| e.id == pid)) {
+            let to_e = (pe.pos[1] - me.pos[1]).atan2(pe.pos[0] - me.pos[0]);
+            for &sgn in &[state.strafe_sign, -state.strafe_sign] {
+                let ang = to_e + sgn * std::f64::consts::FRAC_PI_2;
+                let px = me.pos[0] + ang.cos() * 3.5;
+                let py = me.pos[1] + ang.sin() * 3.5;
+                let pz = map.support_z(px, py, me.pos[2], me.step_up(), me.height());
+                if dist2d([px, py], obs.zone.center) < obs.zone.radius - 3.0
+                    && !map.is_cylinder_blocked(px, py, pz, me.radius() + 0.3, me.height(), me.step_up())
+                {
+                    move_vec = [ang.cos(), ang.sin()];
+                    break;
+                }
+            }
         }
     } else if cur_roof.is_some() && !zone_urgent && !final_circle && dodge.urgency < 0.2 {
         // Anti-mortar micro-pacing on rooftops: never stand dead still for blind mortars!

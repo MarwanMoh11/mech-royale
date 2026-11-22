@@ -1157,10 +1157,38 @@ pub fn decide_combat(
         }
     }
 
-    // 3. Unseen rear-attacker snap
-    if under_unseen_fire && !target_has_los && cmd_aim.is_none() && laser_charge <= 0.0 && !fire[0] && !fire[1] {
+    // 3. Unseen / Tree-Blind Attacker Snap & Blind Return Fire (protocol.md §7: trees block vision, NOT shots!)
+    if under_unseen_fire && !target_has_los && laser_charge <= 0.0 {
         if let Some(b) = state.last_damaged_bearing {
-            cmd_aim = Some([b, 0.0]);
+            // Refine 3D aim from any incoming enemy Gun projectile matching bearing!
+            let mut aim_b = [b, -0.02];
+            for p in &obs.projectiles {
+                if p.kind == "gun" {
+                    let spd = (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1] + p.vel[2] * p.vel[2]).sqrt();
+                    if spd > 100.0 {
+                        let back_yaw = (-p.vel[1]).atan2(-p.vel[0]);
+                        if angle_diff(back_yaw, b).abs() < 0.22 {
+                            let back_pitch = (-p.vel[2]).atan2(p.vel[0].hypot(p.vel[1]).max(1e-6));
+                            aim_b = [back_yaw, back_pitch.clamp(me.min_pitch(), me.max_pitch())];
+                            break;
+                        }
+                    }
+                }
+            }
+            if cmd_aim.is_none() {
+                cmd_aim = Some(aim_b);
+            }
+            if !hold_fire_for_regen && gun_ready && gun_cd <= 2.0 * dt_sim + 1e-4 {
+                if let Some(gs) = gun_slot {
+                    let a1 = slew_one_tick(me.aim, aim_b, me.turn_rate(), me.pitch_rate(), me.min_pitch(), me.max_pitch());
+                    if angle_diff(a1[0], aim_b[0]).abs() < 0.07 {
+                        let dir = aim_dir(a1[0], a1[1]);
+                        if map.raycast_solid(my_muzzle, dir, 45.0).is_none() {
+                            fire[gs] = true;
+                        }
+                    }
+                }
+            }
         }
     }
 
