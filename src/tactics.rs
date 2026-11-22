@@ -41,7 +41,7 @@ fn is_roof_climbable(
             return false;
         }
         let climb_dh = (ep.pos[2] - ep.drop_z).max(0.0);
-        if climb_dh > max_h || climb_dh > 45.0 {
+        if climb_dh > max_h || climb_dh > 28.0 {
             return false;
         }
         let e_need = (climb_dh / (rise * 0.94)).max(0.5) * me.jet_drain() + 10.0;
@@ -775,17 +775,12 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     let mut chosen_hop: Option<RoofHop> = None;
 
     let safe_for_quick_cube = want_more_cubes && hp_frac > 0.65 && !any_enemy_charging && !enemy_lightning_within_52;
-    let laser_pickup_d = desired_pickup_pos
-        .map(|p| dist2d([me.pos[0], me.pos[1]], [p[0], p[1]]))
-        .unwrap_or(999.0);
-    let under_laser_fire = enemy_laser_los_close || any_enemy_charging;
     let laser_loot_priority = !have_laser
         && hp_frac > 0.38
         && enemies_with_los <= 1
         && !enemy_lightning_within_52
         && desired_pickup_is_laser
-        && desired_pickup_pos.is_some()
-        && (!under_laser_fire || laser_pickup_d < 22.0);
+        && desired_pickup_pos.is_some();
     let kill_drop_laser_search = !have_laser
         && desired_pickup_pos.is_none()
         && hp_frac > 0.42
@@ -793,7 +788,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             .last_kill_drop_pos
             .map(|(p, kt, hl)| {
                 let d = dist2d([me.pos[0], me.pos[1]], [p[0], p[1]]);
-                let ok = if hl { enemies_with_los <= 1 && (!under_laser_fire || d < 22.0) && !enemy_lightning_within_52 && t - kt < 55.0 && d < 220.0 }
+                let ok = if hl { enemies_with_los <= 1 && !enemy_lightning_within_52 && t - kt < 55.0 && d < 220.0 }
                          else { enemies_with_los == 0 && t - kt < 25.0 && d < 135.0 };
                 ok && d > 5.0 && dist2d([p[0], p[1]], obs.zone.center) < obs.zone.radius - 6.0
             })
@@ -966,7 +961,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         if !have_laser && me.energy > 20.0 {
             want_boost = true;
         }
-        if is_ffa && ready_for_rooftops && dist2d([me.pos[0], me.pos[1]], [goal_3d[0], goal_3d[1]]) < 14.0 {
+        if have_laser && dist2d([me.pos[0], me.pos[1]], [goal_3d[0], goal_3d[1]]) < 12.0 {
             stealth_walk = true;
             want_boost = false;
         }
@@ -1239,7 +1234,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         state.scan_yaw = wrap_angle(move_yaw + offset);
         [state.scan_yaw, -0.04]
     } else {
-        state.scan_yaw = wrap_angle(state.scan_yaw + 0.35);
+        state.scan_yaw = wrap_angle(me.aim[0] + 0.65);
         [state.scan_yaw, -0.04]
     };
 
@@ -1741,8 +1736,66 @@ fn pick_macro_hold_spot(
     let nr = obs.zone.next_radius;
     let zone_in_stadium = in_stadium_zone(nc[0], nc[1]);
 
-    // Phase A (still looting Laser / early cubes): sweep UNVISITED ground sectors inside next_zone (avoids sounds in FFA/Unknown!)
+    // Phase A (!have_laser): sweep UNVISITED ground sectors inside next_zone to find a Laser!
+    // Phase B (have_laser): HOLD a dense building-cover corner inside next_zone instead of patrolling open streets! (Fable #4)
     if !ready_for_rooftops {
+        let have_laser = find_weapon_slot(me, "laser").is_some();
+        if have_laser {
+            let mut best_hold: Option<(f64, [f64; 3])> = None;
+            let hold_max_r = (nr * 0.68).clamp(18.0, 155.0);
+            let mut eval_spot = |x: f64, y: f64| {
+                if !zone_in_stadium && in_stadium_zone(x, y) { return; }
+                if dist2d([x, y], obs.zone.center) > obs.zone.radius - 10.0 { return; }
+                if nr > 15.0 && dist2d([x, y], nc) > (nr - 8.0).max(12.0) { return; }
+                let tz = map.terrain_z(x, y);
+                if map.terrain_slope_deg(x, y) >= 44.0
+                    || map.is_cylinder_blocked(x, y, tz, me.radius() + 0.5, me.height(), me.step_up())
+                {
+                    return;
+                }
+                let d_me = dist2d([me.pos[0], me.pos[1]], [x, y]);
+                let cov = map.cover_at([x, y]) as f64;
+                let mut sc = cov * 115.0 - d_me * 0.35;
+                if d_me < 8.0 && cov >= 0.25 {
+                    sc += 24.0; // Hysteresis: hold our dense cover corner instead of jittering!
+                }
+                if state.is_ffa() || me.hp < me.max_hp * 0.78 {
+                    for s in &state.sounds {
+                        if obs.t - s.t < 2.2 && dist2d([x, y], s.est_pos) < 85.0 {
+                            sc -= 65.0;
+                        }
+                    }
+                }
+                if best_hold.map(|(bs, _)| sc > bs).unwrap_or(true) {
+                    best_hold = Some((sc, [x, y, tz]));
+                }
+            };
+            // Always evaluate current position + local dense building corners + inner next_zone rings
+            eval_spot(me.pos[0], me.pos[1]);
+            for &(loc_r, cnt) in &[(16.0, 8usize), (34.0, 8usize)] {
+                for k in 0..cnt {
+                    let ang = (k as f64 / cnt as f64) * std::f64::consts::TAU;
+                    let x = (me.pos[0] + ang.cos() * loc_r).clamp(map.min_x + 12.0, map.max_x - 12.0);
+                    let y = (me.pos[1] + ang.sin() * loc_r).clamp(map.min_y + 12.0, map.max_y - 12.0);
+                    eval_spot(x, y);
+                }
+            }
+            for ring in 0..2 {
+                let r_f = if ring == 0 { 0.38 } else { 0.78 };
+                let hr = (hold_max_r * r_f).max(16.0);
+                for step in 0..8 {
+                    let ang = (step as f64 / 8.0) * std::f64::consts::TAU + (ring as f64) * 0.39;
+                    let x = (nc[0] + ang.cos() * hr).clamp(map.min_x + 12.0, map.max_x - 12.0);
+                    let y = (nc[1] + ang.sin() * hr).clamp(map.min_y + 12.0, map.max_y - 12.0);
+                    eval_spot(x, y);
+                }
+            }
+            if let Some((_, pos)) = best_hold {
+                return pos;
+            }
+            return find_safe_zone_target(obs, map, margin_cur);
+        }
+
         let mut best_sw: Option<(f64, [f64; 3])> = None;
         let max_r = (nr * 0.72).clamp(30.0, 210.0);
         for ring in 0..2 {
