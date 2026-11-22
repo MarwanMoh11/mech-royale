@@ -1,6 +1,6 @@
 use crate::map::ArenaMap;
 use crate::protocol::*;
-use crate::world_state::{EnemyTrack, WorldState};
+use crate::world_state::{EnemyTrack, LaserPeekState, WorldState};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -14,6 +14,7 @@ pub struct CombatDecision {
     pub laser_ready_soon: bool,
     pub laser_cd: f64,
     pub want_peek: bool,
+    pub peek_goal: Option<[f64; 3]>,
     pub gun_reloading: bool,
 }
 
@@ -747,17 +748,17 @@ pub fn decide_combat(
         if state.is_ffa() && laser_charge <= 0.0 && obs.alive > 4 && !e.charging && e.last_hit_us_t < t - 4.0 && d > 115.0 && e.hp > e.max_hp * 0.72 && !third_party_kill {
             continue;
         }
-        // Fable #3 (verified on real server stream.jsonl.gz): don't poke distant passive Practice bots that are ignoring us!
+        // Fable #3 (verified on real server stream.jsonl.gz): never gun-poke distant passive Practice bots that ignore us!
         let yaw_e_to_us_pre = (me.pos[1] - e.pos[1]).atan2(me.pos[0] - e.pos[0]);
         let passive_distant = !state.is_ffa()
             && laser_charge <= 0.0
             && e.last_hit_us_t < t - 5.0
             && !e.charging
             && e.hp > e.max_hp * 0.92
-            && d > 115.0
+            && d > 105.0
             && angle_diff(e.aim[0], yaw_e_to_us_pre).abs() > 0.65;
-        if passive_distant && have_laser.is_none() {
-            continue; // Never wake a passive 150m Hard/Expert bot with gun chip while hunting for our Laser!
+        if passive_distant && (have_laser.is_none() || laser_cd > 0.20 || me.hp < me.max_hp * 0.85 || any_enemy_within_70) {
+            continue; // Never wake a passive Hard/Expert bot unless we have a full Laser ready at high HP with no active hunter!
         }
 
         let mut score = 0.0;
@@ -834,6 +835,7 @@ pub fn decide_combat(
     let mut target_enemy_id = None;
     let mut target_has_los = false;
     let mut want_peek = false;
+    let mut peek_goal: Option<[f64; 3]> = None;
 
     if let Some(g) = have_gun {
         let ammo = g.ammo.unwrap_or(12.0);
@@ -907,13 +909,82 @@ pub fn decide_combat(
             }
         }
 
-        // Strict LOS-only laser start (validated by 144-match ablation: ground LOS + boost-charge beats blind pre-charging!)
+        // True Corner-Guided Cover Pre-Charging (Opus #1 + Fable #2):
+        // Probe 4.5m around our corner (0.46s step-out @ 9.75 m/s charge-boost!) and walk DIRECTLY to verified 1v1 peek_pos!
         let close_range_speed_trap = d < 44.0
             && (gun_ready || (have_light.is_some() && me.energy >= light_energy))
             && e.hp > 420.0;
+        let mut precharge_peek_pos: Option<[f64; 3]> = None;
+        if !has_los
+            && laser_charge <= 0.0
+            && laser_slot.is_some()
+            && allow_shoot
+            && laser_cd <= dt_sim + 1e-4
+            && !state.is_laser_shorted(t)
+            && d <= laser_range - 15.0
+            && (t - e.last_seen_t) <= 3.0
+            && !e.source_is_guess
+            && !any_lightning_threat_close
+            && !close_range_speed_trap
+            && me.energy > 28.0
+            && me.in_zone
+        {
+            let my_h = me.height();
+            let my_muz_h = me.muzzle_height();
+            let base_muz = state.config.mech_f("muzzle_height", 7.0);
+            let e_center = e.center(base_h, spc);
+            let cur_roof = map.rooftop_at(me.pos[0], me.pos[1], me.pos[2]);
+            let mut best_pk: Option<(f64, [f64; 3])> = None;
+            for k in 0..12 {
+                let ang = (k as f64 / 12.0) * std::f64::consts::TAU;
+                let px = me.pos[0] + ang.cos() * 4.5;
+                let py = me.pos[1] + ang.sin() * 4.5;
+                if dist2d([px, py], obs.zone.center) > obs.zone.radius - 4.0 {
+                    continue;
+                }
+                let pz = if let Some(r_idx) = cur_roof {
+                    let pid = map.rooftops[r_idx].prism_id;
+                    if !map.point_in_prism_2d(pid, px, py) { continue; }
+                    map.prisms[pid].top
+                } else {
+                    let sz = map.support_z(px, py, me.pos[2], me.step_up(), my_h);
+                    if (sz - me.pos[2]).abs() > 1.8 { continue; }
+                    sz
+                };
+                if map.is_cylinder_blocked(px, py, pz + 0.05, my_r + 0.25, my_h, me.step_up()) {
+                    continue;
+                }
+                // Verify clear walking path from me.pos -> peek_pos (no wall in between!)
+                let mx = 0.5 * (me.pos[0] + px);
+                let my = 0.5 * (me.pos[1] + py);
+                let mz = 0.5 * (me.pos[2] + pz);
+                if map.is_cylinder_blocked(mx, my, mz + 0.05, my_r + 0.2, my_h, me.step_up()) {
+                    continue;
+                }
+                let p_muz = [px, py, pz + my_muz_h];
+                if !map.has_shot_los(p_muz, e_center) {
+                    continue;
+                }
+                let others = state.enemies.values().filter(|oe| {
+                    oe.id != e.id
+                        && (t - oe.last_seen_t) < 4.0
+                        && dist3d(oe.pos, [px, py, pz]) < 220.0
+                        && map.has_shot_los(oe.muzzle(base_muz, spc), [px, py, pz + my_h * 0.78])
+                }).count();
+                if others == 0 {
+                    // Prefer peeking roughly perpendicular to target (tight corner peek!)
+                    let to_e = (e.pos[1] - me.pos[1]).atan2(e.pos[0] - me.pos[0]);
+                    let perp_sc = angle_diff(ang, to_e).sin().abs();
+                    if best_pk.map(|(bs, _)| perp_sc > bs).unwrap_or(true) {
+                        best_pk = Some((perp_sc, [px, py, pz]));
+                    }
+                }
+            }
+            precharge_peek_pos = best_pk.map(|(_, p)| p);
+        }
         let laser_can_start = laser_slot.is_some()
             && allow_shoot
-            && has_los
+            && (has_los || precharge_peek_pos.is_some())
             && laser_cd <= dt_sim + 1e-4
             && !state.is_laser_shorted(t)
             && d <= laser_range
@@ -991,13 +1062,38 @@ pub fn decide_combat(
                     want_peek = true;
                 }
 
+                // Drive corner-guided PeekOut state when pre-charging behind cover!
+                if let LaserPeekState::PeekOut { target_id, peek_pos, started_t, .. } = state.laser_peek {
+                    if target_id == e.id && (t - started_t) < 2.2 {
+                        if laser_charge >= 0.25 && !has_los {
+                            want_peek = true;
+                            peek_goal = Some(peek_pos);
+                        }
+                    } else {
+                        state.laser_peek = LaserPeekState::Idle;
+                    }
+                }
+
                 if has_los && exact_hit && (full_ready || early_kill || about_to_autofire) {
                     fire[ls] = false; // EXPLICIT VERIFIED RELEASE -> HITSCAN BEAM HITS!
+                    state.laser_peek = LaserPeekState::Idle;
                 } else {
                     fire[ls] = true; // KEEP HOLDING CHARGE!
                 }
             } else if laser_can_start {
                 fire[ls] = true;
+                if let Some(pp) = precharge_peek_pos {
+                    state.laser_peek = LaserPeekState::PeekOut {
+                        target_id: e.id,
+                        cover_pos: me.pos,
+                        peek_pos: pp,
+                        started_t: t,
+                    };
+                } else {
+                    state.laser_peek = LaserPeekState::Idle;
+                }
+            } else {
+                state.laser_peek = LaserPeekState::Idle;
             }
         }
 
@@ -1164,6 +1260,10 @@ pub fn decide_combat(
         }
     }
 
+    if laser_charge <= 0.0 && !laser_slot.map(|ls| fire[ls]).unwrap_or(false) {
+        state.laser_peek = LaserPeekState::Idle;
+    }
+
     CombatDecision {
         aim: cmd_aim,
         fire,
@@ -1174,6 +1274,7 @@ pub fn decide_combat(
         laser_ready_soon: laser_slot.is_some() && (laser_charge >= laser_full - 0.35 || laser_cd <= 0.25),
         laser_cd,
         want_peek,
+        peek_goal,
         gun_reloading,
     }
 }

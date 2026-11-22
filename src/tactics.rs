@@ -841,17 +841,16 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             && (!is_ffa || hp_frac < 0.65 || enemies_with_los >= 2);
         let gun_only_outnumbered = !is_ffa && !have_laser && !have_light && hp_frac < 0.85 && enemies_within_115 >= 2;
         let need_heal = state.healing_mode || enemies_with_los >= 2;
-        // Peek-Fire-Hide against ACTUAL Laser holders (denies real Expert bots' 315-dmg Laser during our 1.65s CD!)
+        // Peek-Fire-Hide against ACTUAL Laser holders EVEN at 100% HP (denies real Expert bots' 315-dmg Laser during our 1.65s CD!)
         let enemy_laser_ready_soon = visible_enemies
             .iter()
             .any(|e| e.has_los && e.has_laser && e.laser_ready_t <= t + 0.85);
         let laser_cd_cover = have_laser
             && !kill_commit
             && !combat.charging_laser
-            && combat.laser_cd > 0.60
+            && combat.laser_cd > 0.55
             && enemies_with_los >= 1
-            && enemy_laser_ready_soon
-            && (hp_frac < 0.90 || enemies_with_los >= 2);
+            && enemy_laser_ready_soon;
         let want_cover_only = (winning_hp_race
             || need_heal
             || reload_retreat
@@ -862,37 +861,45 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             && !kill_commit
             && !combat.want_peek;
 
-        let laser_sweep_target = None;
-
-        let chosen = pick_tactical_position(
-            obs,
-            state,
-            map,
-            &visible_enemies,
-            combat.target_enemy_id,
-            want_cover_only,
-            combat.want_peek || losing_hp_race || kill_commit,
-            cur_roof,
-            !want_more_cubes,
-            ready_for_rooftops,
-            laser_sweep_target,
-        );
-        match chosen {
-            MoveCandidate::Pos(p) => {
-                goal_3d = p;
-                state.last_tactical_goal = Some(p);
+        if let Some(pg) = combat.peek_goal {
+            goal_3d = pg;
+            state.last_tactical_goal = Some(pg);
+            if me.energy > 20.0 {
+                want_boost = true;
             }
-            MoveCandidate::Hop(h) => {
-                chosen_hop = Some(h);
-                goal_3d = h.from_pos;
-                state.roof_hop = Some(RoofHopState {
-                    from_pos: h.from_pos,
-                    to_pos: h.to_pos,
-                    to_roof_idx: h.to_roof_idx,
-                    min_energy: h.min_energy,
-                    phase: 0,
-                    started_t: t,
-                });
+        } else {
+            let laser_sweep_target = None;
+
+            let chosen = pick_tactical_position(
+                obs,
+                state,
+                map,
+                &visible_enemies,
+                combat.target_enemy_id,
+                want_cover_only,
+                combat.want_peek || losing_hp_race || kill_commit,
+                cur_roof,
+                !want_more_cubes,
+                ready_for_rooftops,
+                laser_sweep_target,
+            );
+            match chosen {
+                MoveCandidate::Pos(p) => {
+                    goal_3d = p;
+                    state.last_tactical_goal = Some(p);
+                }
+                MoveCandidate::Hop(h) => {
+                    chosen_hop = Some(h);
+                    goal_3d = h.from_pos;
+                    state.roof_hop = Some(RoofHopState {
+                        from_pos: h.from_pos,
+                        to_pos: h.to_pos,
+                        to_roof_idx: h.to_roof_idx,
+                        min_energy: h.min_energy,
+                        phase: 0,
+                        started_t: t,
+                    });
+                }
             }
         }
 
