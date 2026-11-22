@@ -1186,8 +1186,8 @@ pub fn decide_combat(
 
     // 5. Shield-Facing Yaw when not actively aiming at a target; unblock 360-deg scan when hunting Laser!
     if cmd_aim.is_none() {
-        let safe_scan = have_laser.is_none() && !any_enemy_has_los && !any_enemy_within_70
-            && (t - state.last_damaged_t) > 2.2 && dodge.mortar_blast_pos.is_none();
+        let safe_scan = have_laser.is_none() && !any_enemy_has_los
+            && (t - state.last_damaged_t) > 1.8 && dodge.mortar_blast_pos.is_none();
         if !safe_scan {
             if let Some(syaw) = compute_shield_yaw(obs, state, dodge) {
                 cmd_aim = Some([syaw, -0.02]);
