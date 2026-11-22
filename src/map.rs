@@ -361,7 +361,7 @@ impl ArenaMap {
                     let z = row[fz];
                     let height = row[fh];
                     let crown_r = ix_cr.map(|k| row[k]).unwrap_or(3.0);
-                    let crown_base = ix_cb.map(|k| row[k]).unwrap_or(z + height * 0.4);
+                    let crown_base = z + ix_cb.map(|k| row[k]).unwrap_or(height * 0.4);
                     let trunk_r = ix_tr.map(|k| row[k]).unwrap_or(0.5);
                     let crown_x = ix_cx.map(|k| row[k]).unwrap_or(x);
                     let crown_y = ix_cy.map(|k| row[k]).unwrap_or(y);
@@ -1420,6 +1420,13 @@ impl ArenaMap {
                 let ni = uy * self.nav_nx + ux;
                 if !self.nav_walkable[ni] || self.nav_headroom[ni] < need_hr {
                     continue;
+                }
+                if mech_r > 2.75 && self.nav_cover[ni] > 0.0 {
+                    let wx = self.nav_min_x + ux as f64 * NAV_STEP;
+                    let wy = self.nav_min_y + uy as f64 * NAV_STEP;
+                    if self.is_cylinder_blocked(wx, wy, self.nav_z[ni], mech_r + 0.15, mech_h, step_up) {
+                        continue;
+                    }
                 }
                 if (self.nav_z[ni] - self.nav_z[ci]).abs() > 4.5 {
                     continue;

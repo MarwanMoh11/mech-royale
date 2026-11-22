@@ -134,12 +134,27 @@ fn aim_hits_cylinder(actual_aim: [f64; 2], desired_aim: [f64; 2], dist: f64, tar
     rem_yaw <= yaw_tol && rem_pitch <= pitch_tol
 }
 
-/// Multi-height LOS check against an enemy mech (chest, upper torso, lower torso).
+/// Multi-height + lateral corner-slice LOS check against an enemy mech.
 pub fn best_los_point(map: &ArenaMap, from: [f64; 3], e_pos: [f64; 3], e_h: f64) -> Option<[f64; 3]> {
     for frac in [0.50, 0.78, 0.26] {
         let pt = [e_pos[0], e_pos[1], e_pos[2] + e_h * frac];
         if map.has_shot_los(from, pt) {
             return Some(pt);
+        }
+    }
+    // Check lateral chest edges (±1.45m perp) for enemies peeking half-out of a building corner!
+    let dx = e_pos[0] - from[0];
+    let dy = e_pos[1] - from[1];
+    let len = dx.hypot(dy);
+    if len > 4.0 {
+        let px = -dy / len * 1.45;
+        let py = dx / len * 1.45;
+        let cz = e_pos[2] + e_h * 0.55;
+        for sgn in [1.0, -1.0] {
+            let pt = [e_pos[0] + px * sgn, e_pos[1] + py * sgn, cz];
+            if map.has_shot_los(from, pt) {
+                return Some(pt);
+            }
         }
     }
     None
@@ -758,9 +773,6 @@ pub fn decide_combat(
         let ec = e.center(base_h, spc);
         let d = dist3d(my_muzzle, ec);
         if d < 70.0 { any_enemy_within_70 = true; }
-        if e.visible_now && e.has_weapon("lightning") && d < 50.0 {
-            any_lightning_threat_close = true;
-        }
         if d > 285.0 { continue; }
 
         let can_check_los = e.visible_now || (e.source_is_beam && age < 0.40);
@@ -769,7 +781,13 @@ pub fn decide_combat(
         } else {
             None
         };
-        if los_pt.is_some() { any_enemy_has_los = true; }
+        if los_pt.is_some() {
+            any_enemy_has_los = true;
+            // Only veto Laser when the close Lightning holder ACTUALLY has direct LOS (fixes behind-wall veto bug!)
+            if e.visible_now && e.has_weapon("lightning") && d < 48.0 {
+                any_lightning_threat_close = true;
+            }
+        }
 
         // FFA target filtering + third-party snipe (never drop target mid-charge!)
         let third_party_kill = e.hp <= est_instant_burst * 1.15
@@ -1058,16 +1076,21 @@ pub fn decide_combat(
             }
         }
 
-        // B4) GUN (Validate strictly on the FIRST sim tick + Opus B2: never wake unaware >70° rear enemy with 45-dmg gun before 472-dmg rear Laser!)
+        // B4) GUN (Validate strictly on the FIRST sim tick + feasible Opus B2 rear-Laser ambush hold!)
         let yaw_e_to_us_gun = (me.pos[1] - e.pos[1]).atan2(me.pos[0] - e.pos[0]);
-        let hold_gun_for_rear_laser = have_laser.is_some()
-            && !state.is_laser_shorted(t)
-            && d <= laser_range
-            && (laser_charge > 0.0 || laser_cd <= 0.55)
+        let laser_ambush_feasible = laser_charge > 0.0
+            || (have_laser.is_some()
+                && laser_cd <= 0.55
+                && !state.is_laser_shorted(t)
+                && d <= laser_range
+                && !any_lightning_threat_close
+                && !close_range_speed_trap
+                && !ducking_enemy_laser);
+        let hold_gun_for_rear_laser = laser_ambush_feasible
             && !e.charging
             && e.last_hit_us_t < t - 4.0
             && e.hp > 180.0
-            && angle_diff(e.aim[0], yaw_e_to_us_gun).abs() > 1.22;
+            && angle_diff(e.aim[0], yaw_e_to_us_gun).abs() > half_front_arc + 0.05;
         if let Some(gs) = gun_slot {
             if allow_shoot && has_los && d <= gun_range && !mortar_owns_aim && !hold_gun_for_rear_laser {
                 if gun_fires_t1 && barrel_clear_t1 {
@@ -1117,7 +1140,9 @@ pub fn decide_combat(
         .map(|e| target_has_los && dist3d(my_muzzle, e.center(base_h, spc)) < 80.0)
         .unwrap_or(false);
     let in_enemy_fight = laser_charge > 0.0
-        || (target_enemy_id.is_some() && (close_active_mech || (!npc_aggro_active && (target_has_los || fire[0] || fire[1]))))
+        || fire[0]
+        || fire[1]
+        || (target_enemy_id.is_some() && (close_active_mech || (!npc_aggro_active && target_has_los)))
         || (under_unseen_fire && !npc_hit_us_recently)
         || (any_enemy_within_70 && !npc_aggro_active);
 
@@ -1202,7 +1227,12 @@ pub fn decide_combat(
                 cmd_aim = Some([syaw, -0.02]);
             } else {
                 let max_sound_d = if have_laser.is_some() { 120.0 } else { 55.0 };
-                if let Some(s) = state.sounds.iter().rev().find(|s| t - s.t < 1.5 && s.dist_est < max_sound_d) {
+                if let Some(s) = state.sounds.iter().rev().find(|s| {
+                    t - s.t < 1.5
+                        && s.dist_est < max_sound_d
+                        && s.kind != "crate"
+                        && s.kind != "npc_gun"
+                }) {
                     cmd_aim = Some([s.bearing, 0.0]);
                 }
             }
