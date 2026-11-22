@@ -228,6 +228,8 @@ pub struct ArenaMap {
     pub nav_headroom: Vec<f32>,
     pub nav_z: Vec<f64>,
     pub nav_cover: Vec<f32>,
+    pub nav_escape_deg: Vec<u8>,
+    pub nav_escape_score: Vec<f32>,
     astar_scratch: RefCell<AStarScratch>,
 }
 
@@ -416,6 +418,8 @@ impl ArenaMap {
             nav_headroom: Vec::new(),
             nav_z: Vec::new(),
             nav_cover: Vec::new(),
+            nav_escape_deg: Vec::new(),
+            nav_escape_score: Vec::new(),
             astar_scratch: RefCell::new(AStarScratch::new(0)),
         };
 
@@ -457,6 +461,8 @@ impl ArenaMap {
             nav_headroom: vec![999.0],
             nav_z: vec![0.0],
             nav_cover: vec![0.0],
+            nav_escape_deg: vec![4],
+            nav_escape_score: vec![1.0],
             astar_scratch: RefCell::new(AStarScratch::new(1)),
         }
     }
@@ -778,6 +784,63 @@ impl ArenaMap {
                     }
                 }
                 self.nav_cover[idx] = adj_wall.min(4.0) * 0.25;
+            }
+        }
+        self.nav_escape_deg = vec![0; n];
+        self.nav_escape_score = vec![0.0; n];
+        let nx_i = self.nav_nx as isize;
+        let ny_i = self.nav_ny as isize;
+        let cell_ok = |x: isize, y: isize| -> bool {
+            if x < 0 || x >= nx_i || y < 0 || y >= ny_i { return false; }
+            let i = y as usize * self.nav_nx + x as usize;
+            self.nav_walkable[i] && self.nav_headroom[i] >= 10.5
+        };
+        let sec_dirs: [[(i8, i8); 5]; 4] = [
+            [(1,0),(1,1),(1,-1),(0,1),(0,-1)],
+            [(0,1),(1,1),(-1,1),(1,0),(-1,0)],
+            [(-1,0),(-1,1),(-1,-1),(0,1),(0,-1)],
+            [(0,-1),(1,-1),(-1,-1),(1,0),(-1,0)],
+        ];
+        for iy in 0..self.nav_ny {
+            for ix in 0..self.nav_nx {
+                let idx = iy * self.nav_nx + ix;
+                if !self.nav_walkable[idx] { continue; }
+                let mut deg = 0u8; let mut reach32 = 0u8; let mut exit_w = 0u8;
+                for sector in 0..4usize {
+                    let mut seen: u128 = 1u128 << (4 * 9 + 4);
+                    let mut q = [(0i8, 0i8, 0u8); 28];
+                    let mut head = 0usize; let mut tail = 1usize;
+                    let (mut hit24, mut hit32, mut w3) = (false, false, 0u8);
+                    while head < tail {
+                        let (dx, dy, dist) = q[head]; head += 1;
+                        let fwd = match sector { 0 => dx, 1 => dy, 2 => -dx, _ => -dy };
+                        if fwd >= 3 { hit24 = true; if fwd == 3 { w3 = w3.saturating_add(1); } }
+                        if fwd >= 4 { hit32 = true; }
+                        if dist >= 4 { continue; }
+                        let cx = ix as isize + dx as isize; let cy = iy as isize + dy as isize;
+                        let cz = self.nav_z[cy as usize * self.nav_nx + cx as usize];
+                        for &(sx, sy) in &sec_dirs[sector] {
+                            let ndx = dx + sx; let ndy = dy + sy;
+                            if ndx.abs() > 4 || ndy.abs() > 4 { continue; }
+                            let (nfwd, nlat) = match sector { 0 => (ndx, ndy), 1 => (ndy, ndx), 2 => (-ndx, ndy), _ => (-ndy, ndx) };
+                            if nfwd < 1 || nlat.abs() > nfwd { continue; }
+                            let bit = 1u128 << ((ndy + 4) as usize * 9 + (ndx + 4) as usize);
+                            if (seen & bit) != 0 { continue; }
+                            let nx = ix as isize + ndx as isize; let ny = iy as isize + ndy as isize;
+                            if !cell_ok(nx, ny) { continue; }
+                            let ni = ny as usize * self.nav_nx + nx as usize;
+                            if (self.nav_z[ni] - cz).abs() > 4.5 { continue; }
+                            if sx != 0 && sy != 0 && (!cell_ok(cx + sx as isize, cy) || !cell_ok(cx, cy + sy as isize)) { continue; }
+                            seen |= bit;
+                            if tail < q.len() { q[tail] = (ndx, ndy, dist + 1); tail += 1; }
+                        }
+                    }
+                    if hit24 { deg += 1; }
+                    if hit32 { reach32 += 1; }
+                    exit_w = exit_w.saturating_add(w3.min(3));
+                }
+                self.nav_escape_deg[idx] = deg;
+                self.nav_escape_score[idx] = ((deg as f32) * 0.20 + (reach32 as f32) * 0.03 + (exit_w.min(12) as f32 / 12.0) * 0.08).clamp(0.0, 1.0);
             }
         }
     }
@@ -1593,6 +1656,20 @@ impl ArenaMap {
         let iy = (((p[1] - self.nav_min_y) / NAV_STEP).round() as isize)
             .clamp(0, (self.nav_ny - 1) as isize) as usize;
         self.nav_cover[iy * self.nav_nx + ix]
+    }
+
+    pub fn escape_deg_at(&self, p: [f64; 2]) -> u8 {
+        if self.nav_nx < 2 || self.nav_ny < 2 || self.nav_escape_deg.is_empty() { return 4; }
+        let ix = (((p[0] - self.nav_min_x) / NAV_STEP).round() as isize).clamp(0, (self.nav_nx - 1) as isize) as usize;
+        let iy = (((p[1] - self.nav_min_y) / NAV_STEP).round() as isize).clamp(0, (self.nav_ny - 1) as isize) as usize;
+        self.nav_escape_deg[iy * self.nav_nx + ix]
+    }
+
+    pub fn escape_score_at(&self, p: [f64; 2]) -> f32 {
+        if self.nav_nx < 2 || self.nav_ny < 2 || self.nav_escape_score.is_empty() { return 1.0; }
+        let ix = (((p[0] - self.nav_min_x) / NAV_STEP).round() as isize).clamp(0, (self.nav_nx - 1) as isize) as usize;
+        let iy = (((p[1] - self.nav_min_y) / NAV_STEP).round() as isize).clamp(0, (self.nav_ny - 1) as isize) as usize;
+        self.nav_escape_score[iy * self.nav_nx + ix]
     }
 }
 
