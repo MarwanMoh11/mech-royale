@@ -81,6 +81,8 @@ pub struct EnemyTrack {
     pub last_saw_us_t: f64,
     pub source_is_beam: bool,
     pub source_is_guess: bool,
+    pub laser_ready_t: f64,
+    pub external_dmg_t: f64,
 }
 
 impl EnemyTrack {
@@ -119,7 +121,7 @@ impl EnemyTrack {
             self.vel_hist_len += 1;
         }
         if self.vel_hist_len < 3 {
-            self.strafe_erratic = 0.25;
+            self.strafe_erratic = 0.0;
             return;
         }
         let dx = self.pos[0] - my_pos[0];
@@ -209,9 +211,12 @@ pub struct WorldState {
     pub laser_peek: LaserPeekState,
     pub last_probe_t: f64,
     // Mode detection (Practice 1v15 vs Final FFA)
+    pub ffa_confirmed: bool,
     pub ffa_evidence: f64,
     pub practice_evidence: f64,
     pub mode: MatchMode,
+    pub last_kill_drop_pos: Option<([f64; 3], f64)>,
+    pub visited_sectors: [f64; 192],
     // Movement / stuck tracking
     pub prev_pos: [f64; 3],
     pub prev_t: f64,
@@ -220,6 +225,8 @@ pub struct WorldState {
     pub stuck_time: f64,
     pub stuck_escape_until: f64,
     pub stuck_escape_dir: [f64; 2],
+    pub stuck_streak: u32,
+    pub last_stuck_pos: [f64; 2],
     pub zone_boost_active: bool,
     // Rooftop climb, roof-hop & tactical goal hysteresis
     pub climb_state: Option<ClimbState>,
@@ -267,9 +274,12 @@ impl WorldState {
             healing_mode: false,
             laser_peek: LaserPeekState::Idle,
             last_probe_t: -100.0,
+            ffa_confirmed: false,
             ffa_evidence: 0.0,
             practice_evidence: 0.0,
             mode: MatchMode::Unknown,
+            last_kill_drop_pos: None,
+            visited_sectors: [-1000.0; 192],
             prev_pos: [0.0; 3],
             prev_t: -1.0,
             prev_tick: -10,
@@ -277,6 +287,8 @@ impl WorldState {
             stuck_time: 0.0,
             stuck_escape_until: -10.0,
             stuck_escape_dir: [1.0, 0.0],
+            stuck_streak: 0,
+            last_stuck_pos: [1e9, 1e9],
             zone_boost_active: false,
             climb_state: None,
             roof_hop: None,
@@ -302,8 +314,21 @@ impl WorldState {
         (x >> 11) as f64 * (1.0 / ((1u64 << 53) as f64))
     }
 
+    pub fn mark_visited(&mut self, x: f64, y: f64, t: f64) {
+        let gx = (((x + 440.0) / 55.0).floor() as isize).clamp(0, 15) as usize;
+        let gy = (((y + 340.0) / 56.67).floor() as isize).clamp(0, 11) as usize;
+        self.visited_sectors[gy * 16 + gx] = t;
+    }
+
+    pub fn sector_visited_t(&self, x: f64, y: f64) -> f64 {
+        let gx = (((x + 440.0) / 55.0).floor() as isize).clamp(0, 15) as usize;
+        let gy = (((y + 340.0) / 56.67).floor() as isize).clamp(0, 11) as usize;
+        self.visited_sectors[gy * 16 + gx]
+    }
+
     pub fn update(&mut self, obs: &Observation, map: &ArenaMap) {
         let t = obs.t;
+        self.mark_visited(obs.me.pos[0], obs.me.pos[1], t);
         let dt = if self.prev_t >= 0.0 { (t - self.prev_t).clamp(0.05, 1.0) } else { 0.1 };
         if self.prev_t < 0.0 {
             self.initial_alive = obs.alive.max(1);
@@ -376,11 +401,25 @@ impl WorldState {
                         self.our_kills += 1;
                     }
                     if let Some(tid) = ev.target {
-                        self.enemies.remove(&tid);
+                        if let Some(dead) = self.enemies.remove(&tid) {
+                            self.last_kill_drop_pos = Some((dead.pos, t));
+                        }
                         if self.last_damaged_by == Some(tid) {
                             self.last_damaged_by = None;
                             self.last_damaged_bearing = None;
                             self.last_damaged_t = -100.0;
+                        }
+                    }
+                }
+                "took" => {
+                    if let Some(pid) = ev.id.as_ref().and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)).or_else(|| v.as_f64().map(|f| f.round() as i64))) {
+                        self.pickups.remove(&pid);
+                    }
+                }
+                "take_failed" => {
+                    if ev.reason.as_deref() == Some("gone") {
+                        if let Some(pid) = ev.id.as_ref().and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)).or_else(|| v.as_f64().map(|f| f.round() as i64))) {
+                            self.pickups.remove(&pid);
                         }
                     }
                 }
@@ -460,17 +499,21 @@ impl WorldState {
                 }
                 let hp_drop = tr.hp - hp;
                 let in_z = dist2d([a.pos[0], a.pos[1]], obs.zone.center) < obs.zone.radius - 8.0;
-                // Require consecutive obs tick (no skipped hit events!) + tight gap <= 0.25s + hp_drop > us_dmg + 95.0!
+                // Require consecutive obs tick (no skipped hit events!) + tight gap <= 0.25s
                 let no_skipped_obs = self.prev_tick >= 0 && (obs.tick - self.prev_tick) <= 2;
                 if no_skipped_obs
                     && gap <= 0.25
-                    && hp_drop > us_dmg + 95.0
+                    && hp_drop > us_dmg + 40.0
                     && in_z
                     && !near_any_npc
                     && !tr.source_is_beam
                     && !tr.source_is_guess
                 {
-                    self.ffa_evidence += 2.6;
+                    tr.external_dmg_t = t;
+                    // > 175 HP burst inside zone not from us and not from a 25-dmg NPC = confirmed mech-vs-mech FFA!
+                    if hp_drop > us_dmg + 175.0 {
+                        self.ffa_confirmed = true;
+                    }
                 }
                 tr.prev_hp = tr.hp;
                 tr.pos = a.pos;
@@ -525,21 +568,35 @@ impl WorldState {
                     vel_hist: [[0.0; 2]; 6],
                     vel_hist_len: 0,
                     vel_hist_idx: 0,
-                    strafe_erratic: 0.25,
+                    strafe_erratic: 0.0,
                     last_direct_vision_t: if direct_vis { t } else { -100.0 },
                     last_saw_us_t: if enemy_sees_us { t } else { -100.0 },
                     source_is_beam: false,
                     source_is_guess: false,
+                    laser_ready_t: -10.0,
+                    external_dmg_t: -100.0,
                 };
                 tr.push_vel_sample([a.vel[0], a.vel[1]], obs.me.pos);
                 self.enemies.insert(a.id, tr);
             }
         }
 
-        // 2b. Ingest obs.beams exact path[0] muzzle for UNSEEN enemy shooters (tree-canopy wallhack!)
+        // 2b. Ingest obs.beams: update enemy laser cooldown for ALL shooters + exact path[0] muzzle for UNSEEN shooters!
+        let enemy_laser_cd = self.config.weapon_f("laser", "cooldown", 1.65);
         for b in &obs.beams {
             if b.by == obs.me.id || !(0..100).contains(&b.by) || b.path.len() < 2 {
                 continue;
+            }
+            let fired_t = (t - b.age).max(0.0);
+            if b.kind == "laser" {
+                if let Some(tr) = self.enemies.get_mut(&b.by) {
+                    tr.laser_ready_t = tr.laser_ready_t.max(fired_t + enemy_laser_cd);
+                    tr.charging = false;
+                    tr.charge_start_t = None;
+                    if !tr.has_weapon("laser") {
+                        tr.weapons.push("laser".to_string());
+                    }
+                }
             }
             let already_vis = self.enemies.get(&b.by).map(|e| e.visible_now).unwrap_or(false);
             if already_vis {
@@ -605,11 +662,13 @@ impl WorldState {
                         vel_hist: [[0.0; 2]; 6],
                         vel_hist_len: 0,
                         vel_hist_idx: 0,
-                        strafe_erratic: 0.3,
+                        strafe_erratic: 0.0,
                         last_direct_vision_t: -100.0,
                         last_saw_us_t: seen_t,
                         source_is_beam: true,
                         source_is_guess: false,
+                        laser_ready_t: if b.kind == "laser" { fired_t + enemy_laser_cd } else { -10.0 },
+                        external_dmg_t: -100.0,
                     },
                 );
             }
@@ -656,11 +715,13 @@ impl WorldState {
                         vel_hist: [[0.0; 2]; 6],
                         vel_hist_len: 0,
                         vel_hist_idx: 0,
-                        strafe_erratic: 0.3,
+                        strafe_erratic: 0.0,
                         last_direct_vision_t: -100.0,
                         last_saw_us_t: t,
                         source_is_beam: false,
                         source_is_guess: true,
+                        laser_ready_t: -10.0,
+                        external_dmg_t: -100.0,
                     },
                 );
             }
@@ -668,105 +729,17 @@ impl WorldState {
 
         self.enemies.retain(|_, tr| t - tr.last_seen_t <= 12.0);
 
-        // 3. Rock-Solid Mode Detection (capped practice_evidence + fresh-beam LOS check!)
+        // 3. Rock-Solid Death & Unattributed-Burst Mode Detection (ZERO false Practice->FFA flips from house bots shooting crates/NPCs!)
         let non_self_deaths = ((self.initial_alive - obs.alive) - self.our_kills).max(0);
-        let new_non_self_deaths = (non_self_deaths - self.prev_non_self_deaths).max(0);
-        if new_non_self_deaths > 0 {
+        if non_self_deaths > self.prev_non_self_deaths {
             self.prev_non_self_deaths = non_self_deaths;
-            if (non_self_deaths >= 2 && obs.zone.radius > 160.0) || (non_self_deaths >= 1 && t < 85.0) {
-                self.ffa_evidence += 4.8 * (new_non_self_deaths as f64);
-                if non_self_deaths >= 2 && obs.zone.radius > 160.0 {
-                    self.practice_evidence = 0.0;
-                }
-            }
         }
-
-        for b in &obs.beams {
-            if b.by == obs.me.id || b.path.len() < 2 || b.age > 0.12 {
-                continue;
-            }
-            let p0 = b.path[0];
-            let p1 = b.path[1];
-            let beam_yaw = (p1[1] - p0[1]).atan2(p1[0] - p0[0]);
-            let to_us_yaw = (obs.me.pos[1] - p0[1]).atan2(obs.me.pos[0] - p0[0]);
-            if angle_diff(beam_yaw, to_us_yaw).abs() > 0.35 {
-                let max_beam_d = if b.kind == "lightning" {
-                    dist3d(p0, p1) + 8.0
-                } else {
-                    285.0
-                };
-                let aimed_at_other_mech = self.enemies.values().any(|other| {
-                    if other.id == b.by || !other.visible_now {
-                        return false;
-                    }
-                    let oc = other.center(base_h, spc);
-                    let y_other = (other.pos[1] - p0[1]).atan2(other.pos[0] - p0[0]);
-                    angle_diff(beam_yaw, y_other).abs() < 0.22
-                        && dist3d(p0, oc) < max_beam_d
-                        && map.has_shot_los(p0, oc)
-                });
-                if aimed_at_other_mech {
-                    self.ffa_evidence += 2.5;
-                }
-            }
+        if (non_self_deaths >= 1 && obs.zone.radius > 110.0) || non_self_deaths >= 2 {
+            self.ffa_confirmed = true;
         }
-
-        // Cross-aim evidence: ONLY count FFA if enemy A is actively CHARGING laser at enemy B
-        let vis_ids: Vec<i64> = self
-            .enemies
-            .values()
-            .filter(|e| e.visible_now)
-            .map(|e| e.id)
-            .collect();
-        if vis_ids.len() >= 2 {
-            for &id_a in &vis_ids {
-                let ea = &self.enemies[&id_a];
-                if !ea.charging { continue; }
-                let yaw_a_us = (obs.me.pos[1] - ea.pos[1]).atan2(obs.me.pos[0] - ea.pos[0]);
-                if angle_diff(ea.aim[0], yaw_a_us).abs() > 0.48 {
-                    for &id_b in &vis_ids {
-                        if id_a == id_b { continue; }
-                        let eb = &self.enemies[&id_b];
-                        let d_ab = dist3d(ea.pos, eb.pos);
-                        if d_ab < 175.0 {
-                            let yaw_ab = (eb.pos[1] - ea.pos[1]).atan2(eb.pos[0] - ea.pos[0]);
-                            if angle_diff(ea.aim[0], yaw_ab).abs() < 0.22
-                                && map.has_shot_los(ea.center(base_h, spc), eb.center(base_h, spc))
-                            {
-                                self.ffa_evidence += 1.6;
-                            }
-                        }
-                    }
-                }
-            }
-            if non_self_deaths <= 0 {
-                let mut both_aiming_us = 0;
-                for &id in &vis_ids {
-                    if let Some(e) = self.enemies.get(&id) {
-                        let yaw_to_us = (obs.me.pos[1] - e.pos[1]).atan2(obs.me.pos[0] - e.pos[0]);
-                        if angle_diff(e.aim[0], yaw_to_us).abs() < 0.35 {
-                            both_aiming_us += 1;
-                        }
-                    }
-                }
-                if both_aiming_us >= 2 {
-                    let e0 = &self.enemies[&vis_ids[0]];
-                    let e1 = &self.enemies[&vis_ids[1]];
-                    if dist3d(e0.pos, e1.pos) < 110.0
-                        && map.has_shot_los(e0.center(base_h, spc), e1.center(base_h, spc))
-                    {
-                        self.practice_evidence = (self.practice_evidence + 0.35).min(6.0);
-                    }
-                }
-            }
-        }
-        if t > 35.0 && non_self_deaths <= 0 {
-            self.practice_evidence = (self.practice_evidence + 0.30 * dt).min(6.0);
-        }
-
-        self.mode = if self.ffa_evidence >= 4.5 && self.ffa_evidence > self.practice_evidence * 1.5 {
+        self.mode = if self.ffa_confirmed {
             MatchMode::Ffa
-        } else if self.practice_evidence >= 2.0 || (t > 25.0 && non_self_deaths <= 0) {
+        } else if t >= 25.0 && non_self_deaths == 0 {
             MatchMode::Practice1v15
         } else {
             MatchMode::Unknown
@@ -829,7 +802,7 @@ impl WorldState {
         }
         self.pickups.retain(|id, p| {
             if vis_pickup_ids.contains(id) { return true; }
-            if t - p.last_seen_t > 20.0 { return false; }
+            if t - p.last_seen_t > 240.0 { return false; }
             !do_evict || !should_be_visible(p.pos, 0.8)
         });
 
@@ -869,46 +842,61 @@ impl WorldState {
         } else {
             self.stuck_time = (self.stuck_time - 2.0 * dt).max(0.0);
         }
+        if dist2d([obs.me.pos[0], obs.me.pos[1]], self.last_stuck_pos) > 12.0 {
+            self.stuck_streak = 0;
+        }
         if self.stuck_time > 0.65 && t > self.stuck_escape_until {
+            if dist2d([obs.me.pos[0], obs.me.pos[1]], self.last_stuck_pos) <= 12.0 {
+                self.stuck_streak = self.stuck_streak.saturating_add(1);
+            } else {
+                self.stuck_streak = 1;
+                self.last_stuck_pos = [obs.me.pos[0], obs.me.pos[1]];
+            }
             let to_zone_yaw = (obs.zone.next_center[1] - obs.me.pos[1])
                 .atan2(obs.zone.next_center[0] - obs.me.pos[0]);
             let base_ang = self.last_cmd_move[1].atan2(self.last_cmd_move[0]);
-            // Default fallback: reverse 180 deg away from blocked wall (NEVER push back into same wall!)
+            let prev_esc_ang = self.stuck_escape_dir[1].atan2(self.stuck_escape_dir[0]);
             let rev_ang = wrap_angle(base_ang + std::f64::consts::PI);
             let mut best_dir = [rev_ang.cos(), rev_ang.sin()];
             let mut best_sc = f64::NEG_INFINITY;
             for k in 0..12 {
                 let ang = base_ang + (k as f64 / 12.0) * std::f64::consts::TAU;
-                // Skip straight into the wall we just hit
                 if angle_diff(ang, base_ang).abs() < 0.65 {
                     continue;
                 }
-                let mut clear_any = false;
-                for &dist in &[4.5, 7.5] {
+                let mut clear_depth = 0.0;
+                for &dist in &[4.5, 7.5, 14.0] {
                     let tx = obs.me.pos[0] + ang.cos() * dist;
                     let ty = obs.me.pos[1] + ang.sin() * dist;
                     let tz = map.support_z(tx, ty, obs.me.pos[2], obs.me.step_up(), obs.me.height());
                     if !map.is_cylinder_blocked(tx, ty, tz, obs.me.radius() + 0.3, obs.me.height(), obs.me.step_up()) {
-                        clear_any = true;
+                        clear_depth = dist;
+                    } else {
                         break;
                     }
                 }
-                if !clear_any {
+                if clear_depth < 4.5 {
                     continue;
                 }
                 let align_zone = angle_diff(ang, to_zone_yaw).cos();
-                let sc = align_zone * 2.0 + self.next_rand() * 0.4;
+                let mut sc = align_zone * 2.0 + self.next_rand() * 0.4;
+                if self.stuck_streak >= 4 {
+                    sc += clear_depth * 0.35;
+                    if angle_diff(ang, prev_esc_ang).abs() < 0.7 {
+                        sc -= 4.0;
+                    }
+                }
                 if sc > best_sc {
                     best_sc = sc;
                     best_dir = [ang.cos(), ang.sin()];
                 }
             }
             self.stuck_escape_dir = best_dir;
-            // If stuck outside the zone or on elevated bleachers, hold escape slightly longer,
-            // and ONLY add extra zone pull if best_dir is already in the same half-plane as to_zone (never reverse into wall!).
             let on_elevated_non_roof = obs.me.pos[2] > map.terrain_z(obs.me.pos[0], obs.me.pos[1]) + 4.0
                 && map.rooftop_at(obs.me.pos[0], obs.me.pos[1], obs.me.pos[2]).is_none();
-            if !obs.me.in_zone || on_elevated_non_roof {
+            if self.stuck_streak >= 4 {
+                self.stuck_escape_until = t + 2.5;
+            } else if !obs.me.in_zone || on_elevated_non_roof {
                 let zx = obs.zone.next_center[0] - obs.me.pos[0];
                 let zy = obs.zone.next_center[1] - obs.me.pos[1];
                 let zd = zx.hypot(zy).max(1e-6);

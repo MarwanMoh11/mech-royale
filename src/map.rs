@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::BinaryHeap;
 use std::cmp::Ordering;
 use std::fs;
@@ -151,6 +152,44 @@ pub struct RayHit {
 pub const NAV_STEP: f64 = 8.0;
 const GRID_CELL: f64 = 16.0;
 
+struct AStarScratch {
+    gen: u32,
+    seen_gen: Vec<u32>,
+    g_score: Vec<f32>,
+    came_from: Vec<u32>,
+    heap: BinaryHeap<AStarNode>,
+    path: Vec<usize>,
+}
+
+impl AStarScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            gen: 0,
+            seen_gen: vec![0; n],
+            g_score: vec![f32::INFINITY; n],
+            came_from: vec![u32::MAX; n],
+            heap: BinaryHeap::with_capacity(512),
+            path: Vec::with_capacity(128),
+        }
+    }
+    fn reset(&mut self, n: usize) -> u32 {
+        if self.seen_gen.len() != n {
+            self.seen_gen.resize(n, 0);
+            self.g_score.resize(n, f32::INFINITY);
+            self.came_from.resize(n, u32::MAX);
+            self.gen = 0;
+        }
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.seen_gen.fill(0);
+            self.gen = 1;
+        }
+        self.heap.clear();
+        self.path.clear();
+        self.gen
+    }
+}
+
 pub struct ArenaMap {
     pub min_x: f64,
     pub max_x: f64,
@@ -189,6 +228,7 @@ pub struct ArenaMap {
     pub nav_headroom: Vec<f32>,
     pub nav_z: Vec<f64>,
     pub nav_cover: Vec<f32>,
+    astar_scratch: RefCell<AStarScratch>,
 }
 
 impl ArenaMap {
@@ -376,6 +416,7 @@ impl ArenaMap {
             nav_headroom: Vec::new(),
             nav_z: Vec::new(),
             nav_cover: Vec::new(),
+            astar_scratch: RefCell::new(AStarScratch::new(0)),
         };
 
         map.build_rooftops_and_nav();
@@ -416,6 +457,7 @@ impl ArenaMap {
             nav_headroom: vec![999.0],
             nav_z: vec![0.0],
             nav_cover: vec![0.0],
+            astar_scratch: RefCell::new(AStarScratch::new(1)),
         }
     }
 
@@ -683,6 +725,7 @@ impl ArenaMap {
         self.nav_headroom = vec![999.0; n];
         self.nav_z = vec![0.0; n];
         self.nav_cover = vec![0.0; n];
+        *self.astar_scratch.borrow_mut() = AStarScratch::new(n);
 
         for iy in 0..self.nav_ny {
             let y = self.nav_min_y + iy as f64 * NAV_STEP;
@@ -1322,14 +1365,15 @@ impl ArenaMap {
         }
 
         let n = self.nav_nx * self.nav_ny;
-        let mut g_score = vec![f32::INFINITY; n];
-        let mut came_from = vec![u32::MAX; n];
-        let mut heap = BinaryHeap::with_capacity(256);
+        let mut scratch = self.astar_scratch.borrow_mut();
+        let gen = scratch.reset(n);
 
         let s_idx = start.1 * self.nav_nx + start.0;
         let g_idx = goal.1 * self.nav_nx + goal.0;
-        g_score[s_idx] = 0.0;
-        heap.push(AStarNode {
+        scratch.seen_gen[s_idx] = gen;
+        scratch.g_score[s_idx] = 0.0;
+        scratch.came_from[s_idx] = u32::MAX;
+        scratch.heap.push(AStarNode {
             f: octile(start, goal),
             idx: s_idx as u32,
         });
@@ -1344,13 +1388,12 @@ impl ArenaMap {
         let mut best_h = octile(start, goal);
         let need_hr = mech_h as f32 + 0.15;
 
-        while let Some(cur) = heap.pop() {
+        while let Some(cur) = scratch.heap.pop() {
             let ci = cur.idx as usize;
             let cx = ci % self.nav_nx;
             let cy = ci / self.nav_nx;
-            let cg = g_score[ci];
+            let cg = scratch.g_score[ci];
             let ch = octile((cx, cy), goal);
-            // Skip stale heap duplicates (critical for Ohio Stadium concave detours!)
             if cur.f > cg + ch + 1e-3 {
                 continue;
             }
@@ -1359,7 +1402,7 @@ impl ArenaMap {
                 break;
             }
             expanded += 1;
-            if expanded > 1400 {
+            if expanded > 1600 {
                 break;
             }
             if ch < best_h {
@@ -1378,6 +1421,9 @@ impl ArenaMap {
                 if !self.nav_walkable[ni] || self.nav_headroom[ni] < need_hr {
                     continue;
                 }
+                if (self.nav_z[ni] - self.nav_z[ci]).abs() > 4.5 {
+                    continue;
+                }
                 if dx != 0 && dy != 0 {
                     let i1 = cy * self.nav_nx + ux;
                     let i2 = uy * self.nav_nx + cx;
@@ -1388,10 +1434,12 @@ impl ArenaMap {
                     }
                 }
                 let ng = cg + cost;
-                if ng < g_score[ni] {
-                    g_score[ni] = ng;
-                    came_from[ni] = ci as u32;
-                    heap.push(AStarNode {
+                let prev_g = if scratch.seen_gen[ni] == gen { scratch.g_score[ni] } else { f32::INFINITY };
+                if ng < prev_g {
+                    scratch.seen_gen[ni] = gen;
+                    scratch.g_score[ni] = ng;
+                    scratch.came_from[ni] = ci as u32;
+                    scratch.heap.push(AStarNode {
                         f: ng + octile((ux, uy), goal),
                         idx: ni as u32,
                     });
@@ -1402,17 +1450,19 @@ impl ArenaMap {
         if best_closest == s_idx {
             return to;
         }
-        let mut path = Vec::with_capacity(64);
         let mut cur = best_closest;
-        while cur != s_idx && came_from[cur] != u32::MAX {
-            path.push(cur);
-            cur = came_from[cur] as usize;
-            if path.len() > 256 { break; }
+        while cur != s_idx && scratch.seen_gen[cur] == gen && scratch.came_from[cur] != u32::MAX {
+            scratch.path.push(cur);
+            cur = scratch.came_from[cur] as usize;
+            if scratch.path.len() > 2048 { break; }
         }
-        path.reverse();
+        if scratch.path.is_empty() {
+            return to;
+        }
+        scratch.path.reverse();
 
-        let mut chosen = path[0];
-        for &cell_idx in path.iter().take(6) {
+        let mut chosen = scratch.path[0];
+        for &cell_idx in scratch.path.iter().take(6) {
             let wp = self.cell_to_world(cell_idx);
             let mut seg_ok = true;
             for &frac in &[0.33, 0.67] {

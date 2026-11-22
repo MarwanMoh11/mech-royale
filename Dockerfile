@@ -4,11 +4,11 @@ WORKDIR /src
 
 # Cache dependencies first
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
 
 # Build actual bot
 COPY src ./src
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked
 
 # Minimal runtime image (uid 65534 compatible, no network, read-only FS)
 FROM debian:bookworm-slim
