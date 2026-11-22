@@ -827,15 +827,8 @@ pub fn decide_combat(
             && e.hp > e.max_hp * 0.92
             && d > 115.0
             && angle_diff(e.aim[0], yaw_e_to_us_pre).abs() > 0.65;
-        let heal_skip_passive = state.healing_mode
-            && laser_charge <= 0.0
-            && !e.charging
-            && e.last_hit_us_t < t - 2.5
-            && d > 52.0
-            && e.hp > est_instant_burst * 1.15
-            && angle_diff(e.aim[0], yaw_e_to_us_pre).abs() > 0.65;
-        if heal_skip_passive || (passive_distant && (have_laser.is_none() || me.hp < me.max_hp * 0.72)) {
-            continue; // Preserve 5s regen + squad stealth against distant facing-away enemies!
+        if passive_distant && have_laser.is_none() {
+            continue; // Never wake a passive 150m Hard/Expert bot with gun chip while hunting for our Laser!
         }
 
         let mut score = 0.0;

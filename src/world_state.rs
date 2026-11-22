@@ -518,10 +518,12 @@ impl WorldState {
                     && !tr.source_is_guess
                 {
                     tr.external_dmg_t = t;
-                    // > 175 HP burst inside zone not from us and not from a 25-dmg NPC = confirmed mech-vs-mech FFA!
-                    if hp_drop > us_dmg + 175.0 {
-                        self.ffa_confirmed = true;
-                        self.true_ffa_confirmed = true;
+                    if hp_drop > us_dmg + 320.0 && t > 20.0 {
+                        self.ffa_evidence += 1.0;
+                        if self.ffa_evidence >= 2.0 {
+                            self.ffa_confirmed = true;
+                            self.true_ffa_confirmed = true;
+                        }
                     }
                 }
                 tr.prev_hp = tr.hp;

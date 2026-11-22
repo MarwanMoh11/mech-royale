@@ -1328,20 +1328,6 @@ impl ArenaMap {
         mech_h: f64,
         step_up: f64,
     ) -> [f64; 2] {
-        self.next_waypoint_safe(from, to, feet_z, mech_r, mech_h, step_up, &[])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn next_waypoint_safe(
-        &self,
-        from: [f64; 2],
-        to: [f64; 2],
-        feet_z: f64,
-        mech_r: f64,
-        mech_h: f64,
-        step_up: f64,
-        threats: &[([f64; 2], f32)],
-    ) -> [f64; 2] {
         let d = (to[0] - from[0]).hypot(to[1] - from[1]);
         if d < 5.0 {
             return to;
@@ -1364,27 +1350,8 @@ impl ArenaMap {
                 break;
             }
         }
-        if clear && threats.is_empty() {
-            return to;
-        }
         if clear {
-            // Even if geometry is clear, route around an enemy standing directly on the straight path!
-            let mut threat_hit = false;
-            for i in 1..sample_n {
-                let frac = i as f64 / sample_n as f64;
-                let sx = from[0] + (to[0] - from[0]) * frac;
-                let sy = from[1] + (to[1] - from[1]) * frac;
-                for &(tp, _) in threats {
-                    if (sx - tp[0]).hypot(sy - tp[1]) < 46.0 {
-                        threat_hit = true;
-                        break;
-                    }
-                }
-                if threat_hit { break; }
-            }
-            if !threat_hit {
-                return to;
-            }
+            return to;
         }
 
         if self.nav_nx < 2 || self.nav_ny < 2 {
@@ -1466,21 +1433,7 @@ impl ArenaMap {
                         continue;
                     }
                 }
-                let mut extra = 0.0f32;
-                if !threats.is_empty() {
-                    let wx = self.nav_min_x + ux as f64 * NAV_STEP;
-                    let wy = self.nav_min_y + uy as f64 * NAV_STEP;
-                    for &(tp, tw) in threats {
-                        let d2 = (wx - tp[0]) * (wx - tp[0]) + (wy - tp[1]) * (wy - tp[1]);
-                        if d2 < 2704.0 { // 52m radius
-                            let frac = 1.0 - (d2.sqrt() as f32) / 52.0;
-                            extra += tw * frac * frac;
-                        }
-                    }
-                    // Slight preference for wall-adjacent cells when routing around threats
-                    extra -= self.nav_cover[ni] * 0.25;
-                }
-                let ng = cg + (cost + extra).max(0.5);
+                let ng = cg + cost;
                 let prev_g = if scratch.seen_gen[ni] == gen { scratch.g_score[ni] } else { f32::INFINITY };
                 if ng < prev_g {
                     scratch.seen_gen[ni] = gen;
