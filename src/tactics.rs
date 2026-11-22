@@ -316,6 +316,9 @@ struct EnemySummary {
     has_laser: bool,
     #[allow(dead_code)]
     laser_ready_t: f64,
+    gun_reload_until: f64,
+    charge_elapsed: f64,
+    heard_charge_t: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -449,6 +452,9 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             has_lightning: has_lt,
             has_laser: has_ls,
             laser_ready_t: e.laser_ready_t,
+            gun_reload_until: e.gun_reload_until,
+            charge_elapsed: e.charge_elapsed(t),
+            heard_charge_t: e.heard_charge_t,
         });
     }
 
@@ -471,6 +477,9 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
                     has_lightning: false,
                     has_laser: false,
                     laser_ready_t: -10.0,
+                    gun_reload_until: -10.0,
+                    charge_elapsed: 0.0,
+                    heard_charge_t: -100.0,
                 });
                 enemies_with_los += 1;
                 enemies_within_115 += 1;
@@ -548,8 +557,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     let kill_commit = !is_ffa
         && me.in_zone
         && enemies_with_los <= 1
-        && enemies_within_115 <= 1
-        && me.hp > 650.0
+        && me.hp > 380.0
         && best_duel_target
             .map(|e| {
                 let ttk = if have_laser && e.hp <= 315.0 * dmg_mult { 0.6 } else { e.hp / our_dps.max(40.0) };
@@ -783,8 +791,8 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         && desired_pickup_pos.map(|p| dist2d([me.pos[0], me.pos[1]], [p[0], p[1]]) < 28.0 && (p[2] - me.pos[2]).abs() < 4.5).unwrap_or(false);
     let laser_loot_priority = laser_close_dash
         || (!have_laser
-            && hp_frac > 0.42
-            && enemies_with_los == 0
+            && hp_frac > 0.36
+            && enemies_with_los <= 1
             && !enemy_lightning_within_52
             && desired_pickup_is_laser
             && desired_pickup_pos.is_some());
@@ -877,29 +885,37 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             .any(|e| e.has_los && e.has_laser && e.laser_ready_t <= t + 1.15);
         // Opus #5: Offensive Laser Punish-Window Peek — step out immediately after an enemy wastes its Laser
         // (e.g. into our wall after bait_charge!) while our Laser is ready and no other Laser holder threatens us!
-        let primary_laser_on_cd = combat
+        let next_threat_s = |e: &EnemySummary| -> f64 {
+            if e.charging { (0.72 - e.charge_elapsed).max(0.05) }
+            else if t - e.heard_charge_t < 0.85 { 0.25 }
+            else if e.has_lightning && e.dist < 50.0 { 0.0 }
+            else if e.has_laser { (e.laser_ready_t - t).max(0.0) + 0.72 }
+            else if e.gun_reload_until > t + 0.10 { e.gun_reload_until - t }
+            else { 0.24 }
+        };
+        let active_threat_los = visible_enemies.iter().filter(|e| e.has_los && next_threat_s(e) < 0.78).count();
+        let primary_punishable = combat
             .target_enemy_id
             .and_then(|pid| visible_enemies.iter().find(|e| e.id == pid))
-            .map(|e| e.has_laser && (e.laser_ready_t - t) >= 0.85)
+            .map(|e| next_threat_s(e) >= 1.05 || (e.has_laser && (e.laser_ready_t - t) >= 0.85))
             .unwrap_or(false);
-        let other_ready_laser_threat = visible_enemies.iter().any(|e| {
-            Some(e.id) != combat.target_enemy_id
-                && e.has_los
-                && e.has_laser
-                && e.laser_ready_t <= t + 0.85
+        let other_imminent_threat = visible_enemies.iter().any(|e| {
+            Some(e.id) != combat.target_enemy_id && e.has_los && next_threat_s(e) < 0.85
         });
         let punish_peek = have_laser
             && !state.is_laser_shorted(t)
             && (combat.laser_cd <= 0.15 || combat.charging_laser)
-            && primary_laser_on_cd
-            && !other_ready_laser_threat
+            && primary_punishable
+            && !other_imminent_threat
             && !need_heal
-            && enemies_with_los <= 1;
+            && active_threat_los <= 1;
         let laser_cd_cover = have_laser
+            && !kill_commit
             && !combat.charging_laser
-            && combat.laser_cd > 0.35
+            && combat.laser_cd > 0.55
             && enemies_with_los >= 1
-            && enemy_laser_ready_soon;
+            && enemy_laser_ready_soon
+            && (hp_frac < 0.90 || enemies_with_los >= 2);
         let want_cover_only = (winning_hp_race
             || need_heal
             || reload_retreat
@@ -947,8 +963,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
 
         let escaping_lightning = enemy_lightning_within_52 && !have_light;
         // Surgical Pre-Charged Corner Peek (Opus #1 + GPT-6.2 #2): charge behind cover when stepping <= 9.0m into predicted LOS!
-        if false
-            && have_laser
+        if have_laser
             && !want_cover_only
             && !combat.charging_laser
             && !state.is_laser_shorted(t)
@@ -1052,9 +1067,16 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         if !have_laser && me.energy > 20.0 {
             want_boost = true;
         }
-        if have_laser && dist2d([me.pos[0], me.pos[1]], [goal_3d[0], goal_3d[1]]) < 12.0 {
+        if have_laser && (state.is_ffa() || me.hp < me.max_hp * 0.75) && dist2d([me.pos[0], me.pos[1]], [goal_3d[0], goal_3d[1]]) < 12.0 {
             stealth_walk = true;
             want_boost = false;
+        }
+        if !state.is_ffa() && have_laser && me.hp >= me.max_hp * 0.78 && me.energy > 32.0 {
+            if let Some(s) = state.sounds.iter().rev().find(|s| t - s.t < 2.2 && s.dist_est <= 165.0 && dist2d(s.est_pos, obs.zone.next_center) < obs.zone.next_radius) {
+                let tz = map.terrain_z(s.est_pos[0], s.est_pos[1]);
+                goal_3d = [s.est_pos[0], s.est_pos[1], tz];
+                want_boost = true;
+            }
         }
     }
 
@@ -1306,7 +1328,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         }
     }
 
-    if dodge.urgency >= (if state.is_true_ffa() { 2.5 } else { 3.0 }) && me.in_zone && !zone_urgent && !in_air_hop {
+    if dodge.urgency >= 2.5 && me.in_zone && !zone_urgent && !in_air_hop {
         // Pure full-speed corner duck / mortar blast evasion — no diagonal drag from tactical goal!
         move_vec = dodge.vec;
     } else if dodge.urgency > 0.1 && !in_air_hop {
@@ -1826,11 +1848,22 @@ fn pick_tactical_position(
                         }
                     }
                     if near_hard_cover {
-                        sc += 72.0;
+                        sc += 48.0;
                     }
+                    // Opus 5.5 #2 Center-Mass Hull-Down: real server beams aim 0.50h while our muzzle shoots from 0.78h!
                     let cand_center = [cand[0], cand[1], cand[2] + my_h * 0.50];
                     if !map.has_shot_los(pe.muzzle, cand_center) {
-                        sc += 35.0;
+                        sc += 135.0;
+                    }
+                    // PROTOCOL §8 TREE-SCREEN ONE-WAY SNIPER: past 50m, dense trees block enemy vision (center & top) while letting OUR 315-dmg Laser shoot straight through!
+                    // Fast short-circuit: only test top ray if center ray is blocked by trees (and reuse solid LOS!).
+                    if primary_dist > 50.0 && primary_dist < 195.0 && (sc + 260.0 > best_score) {
+                        let pe_eye = [pe.pos[0], pe.pos[1], pe.pos[2] + 8.0];
+                        let cand_top = [cand[0], cand[1], cand[2] + my_h];
+                        let mid_vis_blocked = map.trees_block_vision(pe_eye, cand_center) || !map.has_shot_los(pe_eye, cand_center);
+                        if mid_vis_blocked && (map.trees_block_vision(pe_eye, cand_top) || !map.has_shot_los(pe_eye, cand_top)) {
+                            sc += 165.0;
+                        }
                     }
                 }
             } else if exposed == 0 {
@@ -1930,7 +1963,7 @@ fn pick_macro_hold_spot(
     // Phase B (have_laser): HOLD a dense building-cover corner inside next_zone instead of patrolling open streets! (Fable #4)
     if !ready_for_rooftops {
         let have_laser = find_weapon_slot(me, "laser").is_some();
-        if have_laser {
+        if have_laser && (state.is_ffa() || me.hp < me.max_hp * 0.75) {
             let mut best_hold: Option<(f64, [f64; 3])> = None;
             let hold_max_r = (nr * 0.68).clamp(18.0, 155.0);
             let mut eval_spot = |x: f64, y: f64| {

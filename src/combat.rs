@@ -869,6 +869,7 @@ pub fn decide_combat(
 
         if e.last_hit_us_t > t - 3.0 { score += 65.0; }
         if e.charging { score += 60.0; }
+        if e.gun_reload_until > t + 0.6 && !e.has_weapon("laser") { score += 35.0; }
         if have_laser.is_some() && e.has_weapon("mortar") { score += 60.0; }
         if have_light.is_some() && e.has_weapon("laser") && d < light_range + 22.0 { score += 110.0; }
         if have_laser.is_none() && e.has_weapon("laser") && d < 95.0 { score += 75.0; }

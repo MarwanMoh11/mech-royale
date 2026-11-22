@@ -83,6 +83,10 @@ pub struct EnemyTrack {
     pub source_is_guess: bool,
     pub laser_ready_t: f64,
     pub external_dmg_t: f64,
+    pub gun_reload_until: f64,
+    pub gun_burst_shots: u8,
+    pub last_gun_shot_t: f64,
+    pub heard_charge_t: f64,
 }
 
 impl EnemyTrack {
@@ -244,6 +248,8 @@ pub struct WorldState {
     pub next_strafe_flip_t: f64,
     pub scan_yaw: f64,
     pub rng_state: u64,
+    pub seen_proj_ids: [i64; 32],
+    pub seen_proj_idx: usize,
 }
 
 impl WorldState {
@@ -304,6 +310,8 @@ impl WorldState {
             next_strafe_flip_t: 1.5,
             scan_yaw: 0.0,
             rng_state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+            seen_proj_ids: [-1; 32],
+            seen_proj_idx: 0,
         }
     }
 
@@ -518,12 +526,10 @@ impl WorldState {
                     && !tr.source_is_guess
                 {
                     tr.external_dmg_t = t;
-                    if hp_drop > us_dmg + 320.0 && t > 20.0 {
-                        self.ffa_evidence += 1.0;
-                        if self.ffa_evidence >= 2.0 {
-                            self.ffa_confirmed = true;
-                            self.true_ffa_confirmed = true;
-                        }
+                    // > 175 HP burst inside zone not from us and not from a 25-dmg NPC = confirmed mech-vs-mech FFA!
+                    if hp_drop > us_dmg + 175.0 {
+                        self.ffa_confirmed = true;
+                        self.true_ffa_confirmed = true;
                     }
                 }
                 tr.prev_hp = tr.hp;
@@ -535,10 +541,12 @@ impl WorldState {
                 tr.cubes = cubes;
                 tr.weapons = a.weapons.clone();
                 if a.charging {
-                    if !tr.charging {
-                        tr.charge_start_t = Some(t);
-                    }
+                    if !tr.charging { tr.charge_start_t = Some(t); }
                 } else {
+                    if tr.charging && gap <= 0.25 {
+                        let e_lcd = self.config.weapon_f("laser", "cooldown", 1.65);
+                        tr.laser_ready_t = tr.laser_ready_t.max(t + e_lcd - 0.10);
+                    }
                     tr.charge_start_t = None;
                 }
                 tr.charging = a.charging;
@@ -586,6 +594,10 @@ impl WorldState {
                     source_is_guess: false,
                     laser_ready_t: -10.0,
                     external_dmg_t: -100.0,
+                    gun_reload_until: -10.0,
+                    gun_burst_shots: 0,
+                    last_gun_shot_t: -100.0,
+                    heard_charge_t: -100.0,
                 };
                 tr.push_vel_sample([a.vel[0], a.vel[1]], obs.me.pos);
                 self.enemies.insert(a.id, tr);
@@ -604,8 +616,36 @@ impl WorldState {
                 }
             }
         }
+        let enemy_gun_reload = self.config.weapon_f("gun", "reload", 2.4);
         for s in &obs.sounds {
-            if s.kind == "laser" {
+            if s.kind == "reload" {
+                let start_t = (t - s.age).max(0.0);
+                let mut best: Option<(i64, f64)> = None;
+                for tr in self.enemies.values() {
+                    if t - tr.last_seen_t < 4.5 && tr.has_weapon("gun") {
+                        let d_tr = dist2d([tr.pos[0], tr.pos[1]], [obs.me.pos[0], obs.me.pos[1]]);
+                        if d_tr < 68.0 {
+                            let err = angle_diff((tr.pos[1] - obs.me.pos[1]).atan2(tr.pos[0] - obs.me.pos[0]), s.bearing).abs();
+                            if err < 0.26 && best.map(|(_, be)| err < be).unwrap_or(true) { best = Some((tr.id, err)); }
+                        }
+                    }
+                }
+                if let Some((uid, _)) = best {
+                    if let Some(tr) = self.enemies.get_mut(&uid) {
+                        tr.gun_reload_until = tr.gun_reload_until.max(start_t + enemy_gun_reload);
+                        tr.gun_burst_shots = 0;
+                    }
+                }
+            } else if s.kind == "laser_charge" {
+                let start_t = (t - s.age).max(0.0);
+                for tr in self.enemies.values_mut() {
+                    if t - tr.last_seen_t < 4.5 && tr.has_weapon("laser") && !tr.visible_now {
+                        let d_tr = dist2d([tr.pos[0], tr.pos[1]], [obs.me.pos[0], obs.me.pos[1]]);
+                        let err = angle_diff((tr.pos[1] - obs.me.pos[1]).atan2(tr.pos[0] - obs.me.pos[0]), s.bearing).abs();
+                        if d_tr < 148.0 && err < 0.24 { tr.heard_charge_t = tr.heard_charge_t.max(start_t); }
+                    }
+                }
+            } else if s.kind == "laser" {
                 let fired_t = (t - s.age).max(0.0);
                 let mut best_id: Option<(i64, f64)> = None;
                 let mut n_match = 0usize;
@@ -726,11 +766,49 @@ impl WorldState {
                         source_is_guess: false,
                         laser_ready_t: if b.kind == "laser" { fired_t + enemy_laser_cd } else { -10.0 },
                         external_dmg_t: -100.0,
+                    gun_reload_until: -10.0,
+                    gun_burst_shots: 0,
+                    last_gun_shot_t: -100.0,
+                    heard_charge_t: -100.0,
                     },
                 );
             }
         }
 
+        let gun_mag = self.config.weapon_f("gun", "mag", 12.0).round().max(6.0) as u8;
+        for p in &obs.projectiles {
+            if p.kind != "gun" || self.seen_proj_ids.contains(&p.id) { continue; }
+            self.seen_proj_ids[self.seen_proj_idx] = p.id;
+            self.seen_proj_idx = (self.seen_proj_idx + 1) % self.seen_proj_ids.len();
+            let pspd = (p.vel[0]*p.vel[0] + p.vel[1]*p.vel[1] + p.vel[2]*p.vel[2]).sqrt().max(1.0);
+            let (vx, vy) = (p.vel[0] / pspd, p.vel[1] / pspd);
+            let mut best_shooter: Option<(i64, f64)> = None;
+            for tr in self.enemies.values() {
+                if !tr.visible_now || !tr.has_weapon("gun") { continue; }
+                let dx = p.pos[0] - tr.pos[0]; let dy = p.pos[1] - tr.pos[1];
+                let along = dx * vx + dy * vy; let perp = (dx * (-vy) + dy * vx).abs();
+                if (2.0..=36.0).contains(&along) && perp < 3.2 && best_shooter.map(|(_, ba)| along < ba).unwrap_or(true) {
+                    best_shooter = Some((tr.id, along));
+                }
+            }
+            if let Some((sid, _)) = best_shooter {
+                if let Some(tr) = self.enemies.get_mut(&sid) {
+                    if t - tr.last_gun_shot_t > 2.1 { tr.gun_burst_shots = 0; }
+                    tr.gun_reload_until = -10.0;
+                    tr.gun_burst_shots = tr.gun_burst_shots.saturating_add(1);
+                    tr.last_gun_shot_t = t;
+                }
+            }
+        }
+        for tr in self.enemies.values_mut() {
+            if tr.visible_now && tr.gun_burst_shots >= gun_mag.saturating_sub(1) && t > tr.gun_reload_until {
+                let gap = t - tr.last_gun_shot_t;
+                if (0.55..=1.1).contains(&gap) {
+                    tr.gun_reload_until = tr.last_gun_shot_t + enemy_gun_reload;
+                    tr.gun_burst_shots = 0;
+                }
+            }
+        }
         // 2c. Rough bearing track for unseen projectile attackers (marked source_is_guess = true so we NEVER blind-laser it!)
         if let Some((by, bear)) = unseen_dmg_mech {
             if !self.enemies.contains_key(&by) {
@@ -779,6 +857,10 @@ impl WorldState {
                         source_is_guess: true,
                         laser_ready_t: -10.0,
                         external_dmg_t: -100.0,
+                    gun_reload_until: -10.0,
+                    gun_burst_shots: 0,
+                    last_gun_shot_t: -100.0,
+                    heard_charge_t: -100.0,
                     },
                 );
             }
