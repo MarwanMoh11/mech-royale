@@ -215,7 +215,7 @@ pub struct WorldState {
     pub ffa_evidence: f64,
     pub practice_evidence: f64,
     pub mode: MatchMode,
-    pub last_kill_drop_pos: Option<([f64; 3], f64)>,
+    pub last_kill_drop_pos: Option<([f64; 3], f64, bool)>,
     pub visited_sectors: [f64; 192],
     // Movement / stuck tracking
     pub prev_pos: [f64; 3],
@@ -402,7 +402,9 @@ impl WorldState {
                     }
                     if let Some(tid) = ev.target {
                         if let Some(dead) = self.enemies.remove(&tid) {
-                            self.last_kill_drop_pos = Some((dead.pos, t));
+                            let hl = dead.has_weapon("laser");
+                            let keep = self.last_kill_drop_pos.map(|(_, kt, ol)| ol && !hl && t - kt < 45.0).unwrap_or(false);
+                            if !keep { self.last_kill_drop_pos = Some((dead.pos, t, hl)); }
                         }
                         if self.last_damaged_by == Some(tid) {
                             self.last_damaged_by = None;
