@@ -605,13 +605,34 @@ impl WorldState {
         for s in &obs.sounds {
             if s.kind == "laser" {
                 let fired_t = (t - s.age).max(0.0);
-                for tr in self.enemies.values_mut() {
+                let mut best_id: Option<(i64, f64)> = None;
+                let mut n_match = 0usize;
+                for tr in self.enemies.values() {
                     if t - tr.last_seen_t < 5.0 && tr.has_weapon("laser") {
+                        let d_tr = dist2d([tr.pos[0], tr.pos[1]], [obs.me.pos[0], obs.me.pos[1]]);
+                        let bucket_ok = match s.dist.as_str() {
+                            "near" => d_tr < 78.0,
+                            "mid" => (42.0..=185.0).contains(&d_tr),
+                            _ => d_tr > 135.0,
+                        };
                         let b_tr = (tr.pos[1] - obs.me.pos[1]).atan2(tr.pos[0] - obs.me.pos[0]);
-                        if angle_diff(b_tr, s.bearing).abs() < 0.22 {
+                        let err = angle_diff(b_tr, s.bearing).abs();
+                        if bucket_ok && err < 0.22 {
+                            n_match += 1;
+                            if best_id.map(|(_, be)| err < be).unwrap_or(true) {
+                                best_id = Some((tr.id, err));
+                            }
+                        }
+                    }
+                }
+                if n_match == 1 {
+                    if let Some((uid, _)) = best_id {
+                        if let Some(tr) = self.enemies.get_mut(&uid) {
                             tr.laser_ready_t = tr.laser_ready_t.max(fired_t + enemy_laser_cd);
-                            tr.charging = false;
-                            tr.charge_start_t = None;
+                            if !tr.visible_now {
+                                tr.charging = false;
+                                tr.charge_start_t = None;
+                            }
                         }
                     }
                 }
@@ -774,7 +795,10 @@ impl WorldState {
         {
             self.true_ffa_confirmed = true;
         }
-        if (non_self_deaths >= 1 && obs.zone.radius > 110.0) || non_self_deaths >= 2 {
+        if self.true_ffa_confirmed
+            || (non_self_deaths >= 1 && obs.zone.radius > 165.0 && t < 110.0)
+            || (non_self_deaths >= 2 && t < 165.0)
+        {
             self.ffa_confirmed = true;
         }
         self.mode = if self.ffa_confirmed {

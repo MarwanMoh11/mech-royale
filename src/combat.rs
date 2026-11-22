@@ -909,7 +909,8 @@ pub fn decide_combat(
     if let Some(g) = have_gun {
         let ammo = g.ammo.unwrap_or(12.0);
         let rel = g.reload.unwrap_or(0.0);
-        if rel <= 0.0 && ammo <= 3.0 && !any_enemy_has_los && (t - state.last_enemy_los_t) >= 1.0 {
+        let reload_thresh = if !state.is_ffa() && farm_crate_id.is_none() && farm_npc_id.is_none() { 7.0 } else { 3.0 };
+        if rel <= 0.0 && ammo <= reload_thresh && !any_enemy_has_los && (t - state.last_enemy_los_t) >= 1.1 {
             reload = true;
         }
     }
@@ -979,8 +980,10 @@ pub fn decide_combat(
         }
 
         // Strict LOS-only laser start (validated by 144-match ablation: ground LOS + boost-charge beats blind pre-charging!)
-        let close_range_speed_trap = d < 44.0
-            && (gun_ready || (have_light.is_some() && me.energy >= light_energy))
+        // Only skip Laser at point-blank <18m if we actually have Lightning ready (never throw away 315-dmg Laser at 20-44m!)
+        let close_range_speed_trap = d < 18.0
+            && have_light.is_some()
+            && me.energy >= light_energy
             && e.hp > 420.0;
         let ducking_enemy_laser = dodge.urgency >= 2.5 && dodge.mortar_blast_pos.is_none();
         let laser_can_start = laser_slot.is_some()
@@ -1157,38 +1160,10 @@ pub fn decide_combat(
         }
     }
 
-    // 3. Unseen / Tree-Blind Attacker Snap & Blind Return Fire (protocol.md §7: trees block vision, NOT shots!)
-    if under_unseen_fire && !target_has_los && laser_charge <= 0.0 {
+    // 3. Unseen rear-attacker snap
+    if under_unseen_fire && !target_has_los && cmd_aim.is_none() && laser_charge <= 0.0 && !fire[0] && !fire[1] {
         if let Some(b) = state.last_damaged_bearing {
-            // Refine 3D aim from any incoming enemy Gun projectile matching bearing!
-            let mut aim_b = [b, -0.02];
-            for p in &obs.projectiles {
-                if p.kind == "gun" {
-                    let spd = (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1] + p.vel[2] * p.vel[2]).sqrt();
-                    if spd > 100.0 {
-                        let back_yaw = (-p.vel[1]).atan2(-p.vel[0]);
-                        if angle_diff(back_yaw, b).abs() < 0.22 {
-                            let back_pitch = (-p.vel[2]).atan2(p.vel[0].hypot(p.vel[1]).max(1e-6));
-                            aim_b = [back_yaw, back_pitch.clamp(me.min_pitch(), me.max_pitch())];
-                            break;
-                        }
-                    }
-                }
-            }
-            if cmd_aim.is_none() {
-                cmd_aim = Some(aim_b);
-            }
-            if !hold_fire_for_regen && gun_ready && gun_cd <= 2.0 * dt_sim + 1e-4 {
-                if let Some(gs) = gun_slot {
-                    let a1 = slew_one_tick(me.aim, aim_b, me.turn_rate(), me.pitch_rate(), me.min_pitch(), me.max_pitch());
-                    if angle_diff(a1[0], aim_b[0]).abs() < 0.07 {
-                        let dir = aim_dir(a1[0], a1[1]);
-                        if map.raycast_solid(my_muzzle, dir, 45.0).is_none() {
-                            fire[gs] = true;
-                        }
-                    }
-                }
-            }
+            cmd_aim = Some([b, 0.0]);
         }
     }
 
@@ -1255,10 +1230,10 @@ pub fn decide_combat(
                     let cc = [cr.pos[0], cr.pos[1], cr.pos[2] + 1.2];
                     let d = dist3d(my_muzzle, cc);
                     if map.has_shot_los(my_muzzle, cc) && d < 140.0 {
-                        let use_gun = gun_slot.is_some() && gun_ready && d < gun_range;
-                        let use_light = !use_gun && light_slot.is_some() && d < light_range - 1.0 && me.energy > 35.0;
-                        // Never start charging Laser on crates (prevents P0-1 charged-laser farming lockup & 380m beacon!)
-                        if use_gun || use_light {
+                        let use_laser_crate = false;
+                        let use_gun = !use_laser_crate && gun_slot.is_some() && gun_ready && d < gun_range;
+                        let use_light = !use_laser_crate && !use_gun && light_slot.is_some() && d < light_range - 1.0 && me.energy > 35.0;
+                        if use_laser_crate || use_gun || use_light {
                             let c_dx = cc[0] - my_muzzle[0];
                             let c_dy = cc[1] - my_muzzle[1];
                             let c_dz = cc[2] - my_muzzle[2];
@@ -1267,7 +1242,11 @@ pub fn decide_combat(
                             let nxt = slew_one_tick(me.aim, caim, me.turn_rate(), me.pitch_rate(), me.min_pitch(), me.max_pitch());
                             let sdir = aim_dir(nxt[0], nxt[1]);
                             let bclear = map.has_shot_los(my_muzzle, [my_muzzle[0] + sdir[0] * (my_r + 0.5), my_muzzle[1] + sdir[1] * (my_r + 0.5), my_muzzle[2] + sdir[2] * (my_r + 0.5)]);
-                            if use_gun {
+                            if use_laser_crate {
+                                if let Some(ls) = laser_slot {
+                                    if bclear && aim_hits_cylinder(nxt, caim, d, 1.4, 2.4) { fire[ls] = true; }
+                                }
+                            } else if use_gun {
                                 if let Some(gs) = gun_slot {
                                     if bclear && aim_hits_cylinder(nxt, caim, d, 1.4, 2.4) { fire[gs] = true; }
                                 }
