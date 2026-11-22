@@ -25,8 +25,14 @@ fn is_roof_climbable(
     if cur_roof == Some(roof_idx) {
         return true;
     }
-    if !for_laser_pickup || obs.t < state.climb_cooldown_until {
-        return false; // Ground discipline for combat; allow climbing ONLY to grab a seen rooftop Laser!
+    if obs.t < state.climb_cooldown_until {
+        return false;
+    }
+    if !for_laser_pickup {
+        let r = &map.rooftops[roof_idx];
+        if r.area < 120.0 || (!r.has_penthouse_cover && r.height_above_ground < 16.0) {
+            return false;
+        }
     }
     let me = &obs.me;
     let max_h = max_climb_height(me);
@@ -102,18 +108,17 @@ pub fn pick_upgrade(offer: &Offer, obs: &Observation, state: &WorldState) -> usi
                 }
             }
             "plating" => {
-                let late_g = obs.zone.radius <= 90.0 || obs.alive <= 5;
-                let base = if is_ffa { 144.0 } else { 138.0 };
-                if late_g || hp_frac < 0.62 { base + 10.0 } else { base }
+                let base = if is_ffa { 144.0 } else { 155.0 };
+                if hp_frac < 0.65 { base + 10.0 } else { base }
             }
             "armor" => if is_ffa { 116.0 } else { 122.0 },
             "laser_damage" => if have_laser { if is_ffa { 126.0 } else { 142.0 } } else { 32.0 },
             "laser_charge" => if have_laser { if is_ffa { 130.0 } else { 148.0 } } else { 32.0 },
-            "lightning_range" => if have_light { if is_ffa { 134.0 } else { 136.0 } } else { 28.0 },
-            "servos" => if is_ffa { 126.0 } else { 134.0 },
-            "lightning_efficiency" => if have_light { if is_ffa { 112.0 } else { 118.0 } } else { 25.0 },
-            "jets" => if stacks == 0 { if is_ffa { 84.0 } else { 86.0 } } else { 72.0 },
-            "lightning_chain" => if have_light { if is_ffa { 88.0 } else { 130.0 } } else { 20.0 },
+            "lightning_range" => if have_light { if is_ffa { 114.0 } else { 112.0 } } else { 28.0 },
+            "servos" => if is_ffa { 122.0 } else { 132.0 },
+            "lightning_efficiency" => if have_light { if is_ffa { 98.0 } else { 102.0 } } else { 25.0 },
+            "jets" => if stacks == 0 { if is_ffa { 92.0 } else { 125.0 } } else { 95.0 },
+            "lightning_chain" => if have_light { if is_ffa { 62.0 } else { 96.0 } } else { 20.0 },
             "reactor" => if is_ffa { 88.0 } else { 91.0 },
             "capacitor" => if is_ffa { 82.0 } else { 86.0 },
             "gun_mag" => if have_gun { if have_laser { 100.0 } else { 106.0 } } else { 18.0 },
@@ -208,12 +213,13 @@ pub fn decide_weapon_pickup(
             return Some((135.0, Some(m_slot)));
         }
 
-        // ARCHETYPE A: Swap Gun -> Lightning IMMEDIATELY once we hold Laser! (12-upgrade pool + 240 DPS + 2.0s Laser Short + 14m multi-chain!)
+        // Late-game close quarters (next_radius <= 70 or radius <= 85): swap Gun -> Lightning! (Opus #7 — drops broken energy_ups gate!)
         if kind == "lightning" && already_has("laser") && already_has("gun") {
-            let mid_gunfight = enemies_with_los >= 1 && nearest_enemy_d > 52.0;
-            if !mid_gunfight && gun_ups <= 1 {
+            let mid_gunfight = enemies_with_los >= 1 && nearest_enemy_d > 48.0;
+            let close_endgame = obs.zone.next_radius <= 70.0 || obs.zone.radius <= 85.0;
+            if !mid_gunfight && close_endgame && gun_ups <= 2 {
                 let gun_slot = if w0.kind == "gun" { 0 } else { 1 };
-                return Some((165.0, Some(gun_slot)));
+                return Some((130.0, Some(gun_slot)));
             }
         }
         None
@@ -484,7 +490,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     }
 
     // Pure ground building-cover discipline: stay on ground streets for 0.5s hard-cover slicing & Laser sweeping!
-    let ready_for_rooftops = false;
+    let ready_for_rooftops = !state.is_ffa() && find_weapon_slot(me, "laser").is_some() && hp_frac > 0.52 && me.energy > 46.0 && enemies_with_los == 0 && obs.zone.radius > 45.0;
 
     // 3. Weapon pickup / swap / emergency mortar drop
     let (take_id, drop_slot, desired_pickup_pos, desired_pickup_is_laser) = decide_weapon_pickup(
@@ -1394,14 +1400,10 @@ fn pick_tactical_position(
     let zone_in_stadium = in_stadium_zone(obs.zone.next_center[0], obs.zone.next_center[1]);
     let primary_enemy = primary_id.and_then(|pid| enemies.iter().find(|e| e.id == pid));
 
-    let my_light_range = me.weapons.iter().flatten().find(|w| w.kind == "lightning").map(|w| w.stat("range", 45.0)).unwrap_or(45.0);
-    let nearest_d_e = enemies.iter().map(|e| e.dist).fold(f64::INFINITY, f64::min);
-    let preferred_dist = if have_laser && have_light && nearest_d_e < my_light_range + 22.0 && me.energy > 28.0 && enemies.len() <= 2 && me.hp > me.max_hp * 0.52 {
-        (my_light_range - 7.0).clamp(32.0, 56.0)
-    } else if have_laser {
+    let preferred_dist = if have_laser {
         if !state.is_ffa() && enemies.len() >= 2 { (obs.zone.radius * 0.85).clamp(118.0, 152.0) } else { 118.0 }
     } else if have_light {
-        (my_light_range - 8.0).clamp(30.0, 52.0)
+        34.0
     } else {
         76.0
     };
@@ -1721,10 +1723,13 @@ fn pick_tactical_position(
             }
         }
 
-        // After grabbing a rooftop Laser, never cling to exposed roofs — drop cleanly back down to ground cover!
-        let _ = enemies_on_my_height;
-        if on_rooftop && cand[2] < me.pos[2] - 4.0 && exposed <= 1 {
-            sc += 55.0;
+        if on_rooftop {
+            let stays = cand[2] >= me.pos[2] - 2.0;
+            if stays && exposed == 0 { sc += 120.0; }
+            else if stays && exposed == 1 { sc += 85.0; }
+            else if !stays && (enemies_on_my_height == 0 || me.hp > me.max_hp * 0.45) { sc -= 95.0; }
+        } else if !state.is_ffa() && have_laser && cand[2] > me.pos[2] + 12.0 && exposed <= 1 {
+            sc += 75.0;
         }
         if matches!(mc, MoveCandidate::Hop(_)) {
             if enemies_on_my_height >= 1 || want_cover_only {

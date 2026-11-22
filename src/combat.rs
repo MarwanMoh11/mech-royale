@@ -655,10 +655,10 @@ fn lightning_cone_aim(
     if blocker_angles.is_empty() {
         return enemy_yaw;
     }
-    let max_shift = (light_cone - 0.03).max(0.0);
+    let max_shift = (light_cone - 0.08).max(0.0);
     let mut best_yaw = enemy_yaw;
     let mut best_clear = 0usize;
-    for &frac in &[0.0, 0.35, -0.35, 0.65, -0.65, 0.88, -0.88, 1.0, -1.0] {
+    for &frac in &[0.0, 0.35, -0.35, 0.60, -0.60, 0.80, -0.80] {
         let cand = wrap_angle(enemy_yaw + frac * max_shift);
         let clear = blocker_angles
             .iter()
@@ -946,10 +946,9 @@ pub fn decide_combat(
         }
 
         // Strict LOS-only laser start (validated by 144-match ablation: ground LOS + boost-charge beats blind pre-charging!)
-        let close_range_speed_trap = d < (light_range - 2.0)
+        let close_range_speed_trap = d < 16.0
             && have_light.is_some()
-            && me.energy >= (light_energy * 2.5)
-            && ((e.has_weapon("laser") && e.laser_ready_t <= t + 0.5) || d < 24.0)
+            && me.energy >= light_energy
             && e.hp > 420.0;
         let ducking_enemy_laser = dodge.urgency >= 2.5 && dodge.mortar_blast_pos.is_none();
         let laser_can_start = laser_slot.is_some()
