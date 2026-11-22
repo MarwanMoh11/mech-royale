@@ -41,7 +41,7 @@ fn is_roof_climbable(
             return false;
         }
         let climb_dh = (ep.pos[2] - ep.drop_z).max(0.0);
-        if climb_dh > max_h || climb_dh > 28.0 {
+        if climb_dh > max_h || climb_dh > 45.0 {
             return false;
         }
         let e_need = (climb_dh / (rise * 0.94)).max(0.5) * me.jet_drain() + 10.0;
@@ -775,12 +775,17 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     let mut chosen_hop: Option<RoofHop> = None;
 
     let safe_for_quick_cube = want_more_cubes && hp_frac > 0.65 && !any_enemy_charging && !enemy_lightning_within_52;
+    let laser_pickup_d = desired_pickup_pos
+        .map(|p| dist2d([me.pos[0], me.pos[1]], [p[0], p[1]]))
+        .unwrap_or(999.0);
+    let under_laser_fire = enemy_laser_los_close || any_enemy_charging;
     let laser_loot_priority = !have_laser
         && hp_frac > 0.38
         && enemies_with_los <= 1
         && !enemy_lightning_within_52
         && desired_pickup_is_laser
-        && desired_pickup_pos.is_some();
+        && desired_pickup_pos.is_some()
+        && (!under_laser_fire || laser_pickup_d < 22.0);
     let kill_drop_laser_search = !have_laser
         && desired_pickup_pos.is_none()
         && hp_frac > 0.42
@@ -788,7 +793,7 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             .last_kill_drop_pos
             .map(|(p, kt, hl)| {
                 let d = dist2d([me.pos[0], me.pos[1]], [p[0], p[1]]);
-                let ok = if hl { enemies_with_los <= 1 && !enemy_lightning_within_52 && t - kt < 55.0 && d < 220.0 }
+                let ok = if hl { enemies_with_los <= 1 && (!under_laser_fire || d < 22.0) && !enemy_lightning_within_52 && t - kt < 55.0 && d < 220.0 }
                          else { enemies_with_los == 0 && t - kt < 25.0 && d < 135.0 };
                 ok && d > 5.0 && dist2d([p[0], p[1]], obs.zone.center) < obs.zone.radius - 6.0
             })
