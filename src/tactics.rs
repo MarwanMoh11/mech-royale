@@ -221,7 +221,7 @@ pub fn decide_weapon_pickup(
     for p in &obs.pickups {
         let dh = dist2d([me.pos[0], me.pos[1]], [p.pos[0], p.pos[1]]);
         let dz = (me.pos[2] - p.pos[2]).abs();
-        if dh < reach - 0.15 && dz < 3.85 {
+        if dh <= reach - 0.005 && dz <= 3.995 {
             if let Some((val, drop_slot)) = evaluate_kind(&p.kind) {
                 if let Some(ds) = drop_slot {
                     if laser_charging_slot(ds) { continue; }
@@ -593,7 +593,8 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     // Regen hygiene (Opus #4): don't shoot crates while hurt (<90% HP) unless we still lack Laser/2nd weapon!
     let crate_regen_ok = hp_frac >= 0.90 || missing_second_weapon || !have_laser;
     let crate_safe_d = if !have_laser { 36.0 } else { 55.0 };
-    if me.in_zone && enemies_with_los == 0 && nearest_enemy_d > crate_safe_d && (want_more_cubes || missing_second_weapon || !have_laser) {
+    let sprinting_to_laser = !have_laser && desired_pickup_is_laser && desired_pickup_pos.is_some();
+    if me.in_zone && !sprinting_to_laser && enemies_with_los == 0 && nearest_enemy_d > crate_safe_d && (want_more_cubes || missing_second_weapon || !have_laser) {
         if crate_regen_ok {
             let crate_max_d = if me.cubes < 6 || missing_second_weapon || !have_laser { 135.0 } else { 80.0 };
             let mut best_c_score = f64::NEG_INFINITY;
@@ -817,6 +818,13 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
         goal_3d = dp;
     } else if let Some(cs) = state.climb_state {
         goal_3d = if cs.ascending { cs.edge_pos } else { [cs.launch_xy[0], cs.launch_xy[1], map.terrain_z(cs.launch_xy[0], cs.launch_xy[1])] };
+        if !cs.ascending {
+            let climb_dh = (cs.edge_pos[2] - map.terrain_z(cs.launch_xy[0], cs.launch_xy[1])).max(0.0);
+            let e_need = ((climb_dh / (rise_speed * 0.94)).max(0.5) * me.jet_drain() + 12.0).min(me.max_energy - 2.0);
+            if me.energy > e_need + 14.0 && dist2d([me.pos[0], me.pos[1]], cs.launch_xy) > 8.0 {
+                want_boost = true;
+            }
+        }
     } else if laser_loot_priority {
         goal_3d = desired_pickup_pos.unwrap();
         goal_is_laser_pickup = true;
@@ -1242,13 +1250,28 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
             {
                 state.astar_cache_wp
             } else {
-                let computed = map.next_waypoint_sized(
+                let use_threat_astar = !visible_enemies.is_empty()
+                    && (state.healing_mode
+                        || enemies_with_los >= 2
+                        || enemies_within_115 >= 2
+                        || enemy_lightning_within_52
+                        || zone_urgent
+                        || goal_is_laser_pickup);
+                let mut astar_threats: Vec<([f64; 2], f32)> = Vec::new();
+                if use_threat_astar {
+                    for e in visible_enemies.iter().take(6) {
+                        let w = if e.has_lightning && !have_light { 7.5f32 } else if e.has_laser { 5.0f32 } else { 3.5f32 };
+                        astar_threats.push(([e.pos[0], e.pos[1]], w));
+                    }
+                }
+                let computed = map.next_waypoint_safe(
                     from2,
                     to2,
                     me.pos[2],
                     me.radius(),
                     me.height(),
                     me.step_up(),
+                    &astar_threats,
                 );
                 state.astar_cache_from = from2;
                 state.astar_cache_to = to2;
@@ -1310,6 +1333,10 @@ pub fn decide_action(obs: &Observation, state: &mut WorldState, map: &ArenaMap) 
     }
 
     let mlen = move_vec[0].hypot(move_vec[1]);
+    if state.healing_mode && enemies_with_los == 0 && !zone_urgent && dodge.urgency < 0.2 && dist_goal_2d < 7.0 {
+        stealth_walk = true;
+        want_boost = false;
+    }
     let near_final_pin_lock = final_circle && me.in_zone && dist_to_next_center < 5.0;
     let ls_firing = find_weapon_slot(me, "laser").map(|s| act.fire.unwrap_or([false, false])[s]).unwrap_or(false);
     // Boost while charging laser when moving (Opus #1 — matches real Expert 9.75 m/s charge-boost!)
@@ -1830,7 +1857,7 @@ fn pick_tactical_position(
                     // PROTOCOL §8 TREE-SCREEN ONE-WAY SNIPER: past 50m, dense trees block enemy vision (center & top) while letting OUR 315-dmg Laser shoot straight through!
                     // Fast short-circuit: only test top ray if center ray is blocked by trees (and reuse solid LOS!).
                     if primary_dist > 50.0 && primary_dist < 195.0 && (sc + 260.0 > best_score) {
-                        let pe_eye = [pe.pos[0], pe.pos[1], pe.pos[2] + 8.0];
+                        let pe_eye = [pe.pos[0], pe.pos[1], pe.pos[2] + (pe.muzzle[2] - pe.pos[2]) * (8.0 / 7.0)];
                         let cand_top = [cand[0], cand[1], cand[2] + my_h];
                         let mid_vis_blocked = map.trees_block_vision(pe_eye, cand_center) || !map.has_shot_los(pe_eye, cand_center);
                         if mid_vis_blocked && (map.trees_block_vision(pe_eye, cand_top) || !map.has_shot_los(pe_eye, cand_top)) {

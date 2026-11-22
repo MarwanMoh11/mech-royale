@@ -317,14 +317,14 @@ impl WorldState {
     }
 
     pub fn mark_visited(&mut self, x: f64, y: f64, t: f64) {
-        let gx = (((x + 440.0) / 55.0).floor() as isize).clamp(0, 15) as usize;
-        let gy = (((y + 340.0) / 56.67).floor() as isize).clamp(0, 11) as usize;
+        let gx = (((x + 515.0) / 67.0).floor() as isize).clamp(0, 15) as usize;
+        let gy = (((y + 335.0) / 61.0).floor() as isize).clamp(0, 11) as usize;
         self.visited_sectors[gy * 16 + gx] = t;
     }
 
     pub fn sector_visited_t(&self, x: f64, y: f64) -> f64 {
-        let gx = (((x + 440.0) / 55.0).floor() as isize).clamp(0, 15) as usize;
-        let gy = (((y + 340.0) / 56.67).floor() as isize).clamp(0, 11) as usize;
+        let gx = (((x + 515.0) / 67.0).floor() as isize).clamp(0, 15) as usize;
+        let gy = (((y + 335.0) / 61.0).floor() as isize).clamp(0, 11) as usize;
         self.visited_sectors[gy * 16 + gx]
     }
 
